@@ -1,0 +1,18 @@
+# Local experiments, transcripts, binaries, credential/config snapshots
+.sandbox/
+evidence/
+.cache/
+.tools/
+node_modules/
+*.tgz
+*.log
+*.sqlite*
+auth.json
+.env
+.env.*
+!.env.example
+
+# Local tooling
+__pycache__/
+*.py[cod]
+.DS_Store

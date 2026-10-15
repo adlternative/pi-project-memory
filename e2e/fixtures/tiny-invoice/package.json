@@ -1,0 +1,6 @@
+{
+  "name": "tiny-invoice",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test quote.test.js" }
+}
