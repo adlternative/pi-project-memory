@@ -18,7 +18,7 @@ auth = Path(os.environ.get('PI_MEMORY_AUTH_PATH', str(Path.home() / '.pi/agent/a
 nonce = secrets.token_hex(4)
 old_label, new_label = 'olive-' + nonce, 'cedar-' + secrets.token_hex(4)
 nickname, review_group = 'wren-' + secrets.token_hex(4), 'maple-' + secrets.token_hex(4)
-ask = '请查询这个项目已有的跨会话记忆，告诉我当前演示批次标签和项目昵称。找不到的值用 null，不要从目录名或项目名猜。只返回 JSON：{"batchLabel":值或null,"nickname":值或null}。'
+ask = 'Look up existing cross-session memory for this project and report the current demo batch label and project nickname. Use null for missing values; do not guess from directory or project names. Return only a JSON object with exactly the keys "batchLabel" and "nickname".'
 for name in ['home', 'tmp', 'memory', 'results']:
     (root / name).mkdir()
 for project in ['project-a', 'project-b']:
@@ -43,18 +43,18 @@ console.log('SANDBOX_OK');
 stages = [
     {'name': 'sandbox-probe', 'project': 'project-a', 'mode': 'work', 'prompt': ''},
     {'name': 'project-baseline', 'project': 'project-a', 'mode': 'work', 'prompt': ''},
-    {'name': 'seed', 'project': 'project-a', 'mode': 'work', 'auto': True, 'prompt': f'读 README 和测试，运行项目测试确认基线。以后这个项目的演示批次标签固定为 {old_label}；项目昵称为 {nickname}。这两条是跨会话协作约定，不是业务数据，请记住，分别放在独立主题，方便后续修改。不要把标签或昵称写进源码、测试或 README，也不要改业务代码。最后简短汇报。'},
+    {'name': 'seed', 'project': 'project-a', 'mode': 'work', 'auto': True, 'prompt': f'Read README and the tests, then run project tests to confirm the baseline. For future work, the demo batch label is fixed at {old_label}; the project nickname is {nickname}. These are cross-session collaboration conventions, not business data. Remember them in separate topics for later updates. Do not put the label or nickname in source, tests, or README, and do not change business code. Report briefly.'},
     {'name': 'project-red', 'project': 'project-a', 'mode': 'work', 'prompt': ''},
-    {'name': 'cold-task', 'project': 'project-a', 'mode': 'work', 'editSource': True, 'prompt': '给 quote 的选项增加 shippingCents：默认 0，必须是非负安全整数，在折扣后加入 totalCents，并拒绝最终总金额溢出。只修改 quote.js，测试已经准备好，完成后运行项目测试。遵循项目已有约定，不要把协作标签写到业务文件。最后一行给出你从记忆找回的 JSON：{"batchLabel":当前值或null,"nickname":当前值或null}。'},
-    {'name': 'update', 'project': 'project-a', 'mode': 'work', 'prompt': f'我们修改这个项目的协作约定：演示批次标签从现在起改为 {new_label}。请在对应的主题 Markdown 里直接替换旧值，不保留旧标签或历史说明；昵称等其他记忆保持不变。不要修改业务源码、测试或 README。'},
+    {'name': 'cold-task', 'project': 'project-a', 'mode': 'work', 'editSource': True, 'prompt': 'Add a shippingCents option to quote: default 0, require a nonnegative safe integer, add it to totalCents after the discount, and reject final-total overflow. Modify only quote.js; the tests are ready. Run project tests afterward. Follow existing project conventions and do not put collaboration labels in business files. On the final line, return a JSON object with exactly "batchLabel" and "nickname", using the current values recalled from memory or null when unknown.'},
+    {'name': 'update', 'project': 'project-a', 'mode': 'work', 'prompt': f'Change this project collaboration convention: from now on the demo batch label is {new_label}. Replace the old value directly in the corresponding topic Markdown without retaining the old label or a historical explanation. Keep the nickname and other memories unchanged. Do not modify business source, tests, or README.'},
     {'name': 'cold-updated', 'project': 'project-a', 'mode': 'recall', 'prompt': ask},
-    {'name': 'semantic', 'project': 'project-a', 'mode': 'recall', 'prompt': '请用 pmem_search 的 semantic 模式检索“给试运行订单贴的那组名字”及“团队对这个小程序的叫法”，再回答当前值；只能根据项目记忆，不要猜。只返回 JSON：{"batchLabel":值或null,"nickname":值或null}。'},
+    {'name': 'semantic', 'project': 'project-a', 'mode': 'recall', 'prompt': 'Use pmem_search in semantic mode to retrieve "the tag used for groups of demo orders" and "what the team calls this little app", then report their current values using only project memory. Do not guess. Return only a JSON object with exactly "batchLabel" and "nickname", using null for missing values.'},
     {'name': 'disabled-control', 'project': 'project-a', 'mode': 'disabled', 'prompt': ask},
     {'name': 'other-project', 'project': 'project-b', 'mode': 'recall', 'prompt': ask},
     {'name': 'forget', 'project': 'project-a', 'mode': 'forget', 'prompt': '', 'forgetIds': []},
     {'name': 'after-forget', 'project': 'project-a', 'mode': 'recall', 'prompt': ask},
-    {'name': 'auto', 'project': 'project-a', 'mode': 'auto', 'auto': True, 'prompt': f'以后这个项目的评审卡片归入分组 {review_group}，这是未来协作流程，不是业务配置，不需要改代码。这次只运行项目测试，给我一行结果。'},
-    {'name': 'cold-auto', 'project': 'project-a', 'mode': 'recall', 'prompt': '请查已有跨会话记忆：这个项目的评审卡片以后归哪个分组？只返回 JSON：{"reviewGroup":值或null}；没有记录就填null，不要猜。'},
+    {'name': 'auto', 'project': 'project-a', 'mode': 'auto', 'auto': True, 'prompt': f'From now on, review cards for this project belong to group {review_group}. This is a future collaboration workflow, not business configuration, and requires no code change. For this turn, only run project tests and give a one-line result.'},
+    {'name': 'cold-auto', 'project': 'project-a', 'mode': 'recall', 'prompt': 'Look up existing cross-session memory: which group should future review cards for this project use? Return only a JSON object with exactly the key "reviewGroup". Use null if there is no record; do not guess.'},
     {'name': 'project-final', 'project': 'project-a', 'mode': 'work', 'prompt': ''},
 ]
 config = {'modelId': model, 'authPath': str(auth), 'stages': stages}

@@ -182,8 +182,8 @@ test("evidence respects branch navigation, omitted/context-edited messages, and 
 
 test("read-time fragments remain byte-bounded even with full multilingual notes", async t => {
   const h = await makeHarness(t);
-  for (let i = 0; i < 24; i++) await h.store.save([{ id: "note-" + i, type: "project", title: clip("中文设计取舍".repeat(20), 150), content: clip("这里记录项目的重要设计取舍和外部参考。".repeat(100), 1880) + i, source: { sessionId: "old", entryId: "e" + i, quote: "合成测试", origin: "explicit" } }]);
-  await h.session.prompt("解释中文设计取舍。");
+  for (let i = 0; i < 24; i++) await h.store.save([{ id: "note-" + i, type: "project", title: clip("\u4e2d\u6587\u8bbe\u8ba1\u53d6\u820d".repeat(20), 150), content: clip("\u8fd9\u91cc\u8bb0\u5f55\u9879\u76ee\u7684\u91cd\u8981\u8bbe\u8ba1\u53d6\u820d\u548c\u5916\u90e8\u53c2\u8003\u3002".repeat(100), 1880) + i, source: { sessionId: "old", entryId: "e" + i, quote: "\u5408\u6210\u6d4b\u8bd5", origin: "explicit" } }]);
+  await h.session.prompt("\u89e3\u91ca\u4e2d\u6587\u8bbe\u8ba1\u53d6\u820d\u3002");
   const messages = h.requests[0].context.messages;
   const injected = messages.filter(message => message.role === "user" && JSON.stringify(message.content).includes("Untrusted saved project notes"));
   assert.equal(injected.length, 1);

@@ -142,8 +142,8 @@ test("repository common-dir scopes worktrees together, different repos/directori
 });
 
 test("UTF-8 caps and redaction cover multilingual text and known credential shapes", () => {
-  assert.equal(clip("中🙂文abc", 6), "中");
-  assert.equal(Buffer.byteLength(clip("中🙂文abc", 8)), 7);
+  assert.equal(clip("\u4e2d\u{1f642}\u6587abc", 6), "\u4e2d");
+  assert.equal(Buffer.byteLength(clip("\u4e2d\u{1f642}\u6587abc", 8)), 7);
   const secret = "sk-" + "x".repeat(32);
   const text = 'Bearer fakecredentialhere; password=sample-password ' + secret + ' https://example.invalid/?token=sample-token&x=1';
   const redacted = redact(text);
@@ -160,16 +160,16 @@ test("credentials cannot be stored as note text or provenance", async t => {
 test("BM25 ranks title matches and Chinese text, handles NFKC, returns no fabricated matches", () => {
   const asNote = (input: Draft): Memory => ({ ...input, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" });
   const notes = [
-    asNote({ ...draft("frontend", "前端文档写作要简短，重点解释设计取舍。"), title: "前端文档" }),
-    asNote(draft("backend", "后端部署必须在测试环境验证。")),
+    asNote({ ...draft("frontend", "\u524d\u7aef\u6587\u6863\u5199\u4f5c\u8981\u7b80\u77ed\uff0c\u91cd\u70b9\u89e3\u91ca\u8bbe\u8ba1\u53d6\u820d\u3002"), title: "\u524d\u7aef\u6587\u6863" }),
+    asNote(draft("backend", "\u540e\u7aef\u90e8\u7f72\u5fc5\u987b\u5728\u6d4b\u8bd5\u73af\u5883\u9a8c\u8bc1\u3002")),
     asNote({ ...draft("pnpm", "Preferred package manager."), title: "pnpm" }),
     asNote(draft("incidental", "Other rules. A pnpm reference appears here.")),
   ];
-  assert.equal(search(notes, "前端文档")[0].note.id, "frontend");
+  assert.equal(search(notes, "\u524d\u7aef\u6587\u6863")[0].note.id, "frontend");
   assert.equal(search(notes, "ＰＮＰＭ")[0].note.id, "pnpm");
   assert.deepEqual(search(notes, "doesnotexist"), []);
   assert.deepEqual(search(notes, "!!!"), []);
-  assert.ok(tokenize("中文编程").includes("b:编程"));
+  assert.ok(tokenize("\u4e2d\u6587\u7f16\u7a0b").includes("b:\u7f16\u7a0b"));
 });
 
 test("extraction validates evidence, role, duplicate ids, secret text and unknown fields", () => {

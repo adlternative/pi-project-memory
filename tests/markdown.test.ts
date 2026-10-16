@@ -19,7 +19,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
 
 test("Markdown topics round-trip CC-style flat frontmatter, Unicode, quotes and maximum body bytes", async t => {
   const { store } = await fixture(t);
-  const body = clip("中文设计取舍🙂".repeat(400), 2000);
+  const body = clip("\u4e2d\u6587\u8bbe\u8ba1\u53d6\u820d\u{1f642}".repeat(400), 2000);
   const [saved] = await store.save([{ ...draft(), title: 'The "quoted" user preference', content: body }]);
   const path = join(store.dir, "feedback_tools.md");
   const raw = await readFile(path, "utf8");

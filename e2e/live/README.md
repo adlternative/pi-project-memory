@@ -58,6 +58,12 @@ No global Pi install, reload, credential mutation, or sandbox/network weakening 
 - Main report on the original developer machine: `evidence/live-micro-project.json`; each stage's `results/<stage>/result.json` and session JSONL are under the run directory. Raw reports, conversations, credential fingerprints and sandbox directories are intentionally not committed; a new run creates a new local report.
 - The initial environment-only failed attempt remains at `.sandbox/live-project-9zqwwr5q/`; it stopped before model work. There was no failed model-result retry used to select a passing trial.
 
+## English-prompt validation
+
+The committed runner now uses English prompts throughout. The full English run at `.sandbox/live-project-v08wanp6/` passed the same 15 stages and 17 acceptance checks using 10 fresh real-model conversations. It used 60,566 total tokens with a catalog estimate of USD 0.132588, not an invoice; credential mutation attempts remained zero.
+
+An initial literal paraphrase, "the names attached to trial orders", returned no batch-label topic even though the final answer could use injected recall. The tool-result assertion correctly rejected that attempt. Its records remain at `.sandbox/live-project-nl1ovjlh/`. The query was clarified to "the tag used for groups of demo orders"; a focused live check returned both expected topics, and the full fresh English journey passed without weakening assertions or changing retrieval code. Model-assisted relevance remains sensitive to query ambiguity.
+
 ## Limits and a retention finding
 
 This is one model and one small project, not a broad reliability benchmark. No concurrent-load or cross-platform real-model claim is made.
