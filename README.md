@@ -1,24 +1,132 @@
-# pi-project-memory 0.2
+# pi-project-memory
 
-A native Pi extension with Claude Code-style **`MEMORY.md` navigation and one Markdown file per memory**. Agents can make focused changes with ordinary `read/edit/write` tools instead of rewriting a JSON store. Includes local English/CJK BM25, optional model-assisted semantic selection, and opt-in incremental extraction.
+Persistent, editable project memory for [Pi](https://pi.dev): a `MEMORY.md` index plus one Markdown file per memory, so the agent can read and patch a single fact with ordinary `read`/`edit` tools instead of rewriting a database.
 
-**Nothing is installed into global Pi by default.** The isolated launcher writes only under this project's `.sandbox/`. Development validation did not modify the running Pi configuration or the Codex repository. See [RESEARCH.md](./RESEARCH.md) for sources and design decisions. Raw experiments, conversations, credentials, and analysis artifacts are not committed.
+Because memory is plain Markdown, you own it: open the folder in your editor, delete a file to forget something, or hand-edit a note. The extension keeps the index, provenance, and hidden state files in sync.
 
-## File layout
+- Local English/CJK BM25 search with no network call
+- Optional model-assisted semantic search for paraphrases and cross-language queries
+- Optional, opt-in automatic extraction of durable facts at the end of a successful turn
+- Per-repository scope: worktrees and subdirectories of one repo share memory; unrelated projects stay isolated
+- Bounded recall (6 KB per request) instead of replaying everything ever saved
+
+> This repository is private. `pi install` needs Git access to it — see [Install](#install).
+
+## Requirements
+
+- Pi with extensions support (developed and tested against Pi 1.2.0)
+- Node.js 22.19.0 or newer
+- `git` on `PATH` and read access to this repository
+
+## Install
+
+Install for all projects (writes to `~/.pi/agent/settings.json`):
+
+```bash
+pi install git:github.com/adlternative/pi-project-memory
+```
+
+Install for the current project only (writes to `.pi/settings.json`, applies after you trust the folder):
+
+```bash
+pi install -l git:github.com/adlternative/pi-project-memory
+```
+
+Try it for a single run without installing anything:
+
+```bash
+pi -e git:github.com/adlternative/pi-project-memory
+```
+
+### Private repository access
+
+Pi clones this repository with your normal Git credentials. Use either:
+
+```bash
+gh auth login            # the account needs access to this private repo
+# or make sure SSH works:
+ssh -T git@github.com
+```
+
+If cloning fails, Pi reports the Git error; fix Git access first, then re-run `pi install`.
+
+### From a local checkout
+
+```bash
+git clone git@github.com:adlternative/pi-project-memory.git
+pi install ./pi-project-memory
+```
+
+Restart Pi, or run `/reload` in a running session, so the extension loads.
+
+### Verify
+
+```bash
+pi list                  # shows the installed package
+pi --help                # lists --memory-dir, --memory-auto, --memory-disabled
+```
+
+In a session, `/pmem` prints the memory directory for the current project.
+
+## First memory
+
+Start Pi in a repository and just tell it what to remember:
+
+```text
+Remember that this project uses pnpm, not npm, and that reviews go to the #payments-review group.
+```
+
+The agent saves each fact as its own topic file. In a later session, without repeating yourself:
+
+```text
+How should I install dependencies here, and where do reviews go?
+```
+
+Recall happens automatically: before each model request the extension injects the bounded index plus the most relevant notes, marked as untrusted historical data. The agent can also search and read memory explicitly with the tools below.
+
+Review what was saved:
+
+```text
+/pmem list
+/pmem show package-manager
+```
+
+## Tools and commands
+
+| Tool | Purpose |
+|---|---|
+| `pmem_list({offset?})` | Ten previews per page with relative `.md` paths and `nextOffset` |
+| `pmem_read({id})` | One complete note with its path and provenance |
+| `pmem_search({query, mode?})` | Local `keyword` BM25 by default; optional `semantic` model selection; up to five matches |
+| `pmem_save({id,type,title,description?,content})` | Create or update one topic file |
+
+Structured tool output is `{directory,indexPath,notes,truncated,nextOffset}`; each `note.path` is relative to `directory`.
+
+| Command | Purpose |
+|---|---|
+| `/pmem` | Directory, note count, revision, and extraction status |
+| `/pmem list [offset]` | Paginate the index |
+| `/pmem show <id>` | Show content and provenance |
+| `/pmem forget <id>` | Delete the topic, drop its index link, record a tombstone |
+| `/pmem auto on\|off` | Toggle automatic extraction for this session only |
+| `/pmem extract` | Extract unprocessed evidence from the active branch now |
+
+## Where memory lives
 
 ```text
 <agent-dir>/project-memory/<project-hash>/
-├── MEMORY.md                  # Navigation; custom prose outside the generated block is preserved
-├── feedback_tools.md          # One topic; the filename is its stable id
-├── project_decisions.md
-├── .state.json                # Revision, provenance quotes, timestamps, hashes, tombstones; no body field
-├── .legacy-memories.json       # Byte-exact original JSON backup, present only after migration
-└── .pending.json               # Present only during a transaction or interrupted recovery
+├── MEMORY.md              # Navigation; your own prose outside the generated block is kept
+├── package-manager.md     # One topic; the filename is its stable id
+├── review-process.md
+├── .state.json            # Revision, provenance, timestamps, hashes, tombstones
+└── .pending.json          # Only during a transaction or interrupted recovery
 ```
 
-`<agent-dir>` follows `PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent`. `--memory-dir /absolute/base` overrides the base while retaining project separation. The canonical Git common-directory path identifies a project: subdirectories, worktrees, and sessions in the same repository share memory; different repositories do not. Non-Git directories use their canonical cwd. There is no cross-project user-profile pool.
+`<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise. Override the base directory with `--memory-dir /absolute/path`; projects remain separated underneath it.
 
-Topic files use simple YAML frontmatter and a normal Markdown body:
+The canonical Git common directory identifies a project, so all worktrees, subdirectories, and sessions of one repository share memory. Non-Git directories use their canonical working directory. Nothing is pooled across unrelated projects.
+
+### Editing a topic by hand
 
 ```markdown
 ---
@@ -31,15 +139,13 @@ modified: "2026-10-15T00:00:00.000Z"
 Use pnpm rather than npm by default.
 ```
 
-- Filenames contain lowercase letters, digits, `-`, or `_`, up to 64 characters. `memory` is reserved for the index.
-- `name` and `type` are required; `description` and `modified` are optional. Types are `user/feedback/project/reference`.
-- Supports flat plain strings, JSON double-quoted strings, and YAML single-quoted strings. Folded values, nested YAML, and aliases are not supported. Add a YAML parser only if complex metadata becomes necessary; no extra runtime dependency is needed today.
-- **To change one fact, edit that topic's body.** There is no need to modify internal JSON. The next read detects file changes, updates provenance/timestamps/revision, and synchronizes the index. Successful standard-tool writes also trigger immediate validation and synchronization.
-- Manual edits receive `file` provenance instead of inheriting the previous session's quote. Ordinary `edit` does not rewrite the `modified` line, avoiding interference with the host's read/write cache and unnecessary diffs. Actual change times come from the file and internal metadata; inspect them with `pmem_read`.
+- `name` and `type` are required; `description` and `modified` are optional. Types are `user`, `feedback`, `project`, `reference`.
+- Filenames are lowercase letters, digits, `-`, or `_`, up to 64 characters. `memory` is reserved for the index.
+- Flat plain, JSON double-quoted, and YAML single-quoted values are supported. Folded values, nested YAML, and aliases are not.
+- Delete a topic file to forget it. Recreating it later is an explicit manual restore.
+- Do not edit `.state.json`, `.pending.json`, or `.lock`. They are internal.
 
-## Maintaining MEMORY.md
-
-The extension rebuilds only links between these markers. Custom prose outside the block is preserved:
+`MEMORY.md` is regenerated only inside its markers, so custom notes above or below survive:
 
 ```markdown
 # Project memory
@@ -47,115 +153,114 @@ The extension rebuilds only links between these markers. Custom prose outside th
 Add your own navigation guidance here.
 
 <!-- pi-memory:index:start -->
-- [Package manager preference](feedback_tools.md) — feedback
+- [Package manager preference](package-manager.md) — feedback
 <!-- pi-memory:index:end -->
-
-Additional annotations can go here.
 ```
 
-The index is not a second source of truth for note bodies. Edit topic files to change facts. Do not put unique information inside the generated block or modify hidden state, locks, migration backups, or journals. A standard-tool write with invalid frontmatter is not silently rolled back: the tool reports ingestion failure and the agent can repair it with `edit`. Recall reports temporary unavailability rather than treating a damaged store as empty.
+## Configuration
 
-## Isolated trial
-
-```bash
-cd pi-project-memory
-npm ci --ignore-scripts
-./run-sandbox.sh
-# Enable optional automatic extraction:
-./run-sandbox.sh --memory-auto
-# Separate an initial prompt with -- so Pi's extension boolean flag does not consume it:
-./run-sandbox.sh --memory-auto -- "Use pnpm rather than npm for this project's future work."
-```
-
-The launcher creates configuration, sessions, a project, and memory only under `.sandbox/manual/`. It disables discovered extensions, skills, context files, and MCP, loading only this extension and the experimental `sandbox-guard.ts`.
-
-The trial provides four memory tools plus ordinary `read/edit/write`. **File tools are restricted to the current project's `MEMORY.md` and topic `.md` files**: they cannot access global Pi, other projects, hidden state, or arbitrary source files. There is no shell tool. A missing experimental root makes the guard refuse file tools rather than fail open. Normal installation does not load this lab guard or restrict the user's entire Pi to memory editing.
-
-The launcher does not run `pi install` or `/reload` and does not inherit global settings/auth files. Existing provider environment variables can still authenticate manual trials. If `/login` is needed, credentials are written only to the experimental agent directory. This is configuration/data/tool-scope isolation, not an OS sandbox.
-
-## Tools and commands
-
-| Tool | Purpose |
+| Flag | Effect |
 |---|---|
-| `pmem_list({offset?})` | Ten previews per page, with relative `.md` paths and `nextOffset` |
-| `pmem_read({id})` | A complete note, relative file path, and provenance |
-| `pmem_search({query, mode?})` | Local `keyword` BM25 by default; optional `semantic` model selection; up to five matches |
-| `pmem_save({id,type,title,description?,content})` | Create/update one topic Markdown file, retaining its id; useful without standard file tools |
+| `--memory-dir <path>` | Base directory for all project stores |
+| `--memory-auto` | Enable automatic extraction for this run (opt-in, uses extra model calls) |
+| `--memory-disabled` | Disable reads, writes, and nested model calls for this process |
 
-Structured output is `{directory,indexPath,notes,truncated,nextOffset}`. Each `note.path` is relative to `directory`. Standard file tools are optional: the four memory tools work independently. Tool guidance asks for an explicit user request before saving/editing memory; it is not a hard semantic authorization check on natural language.
+`--memory-auto` covers the whole session, since it is a process flag. Use `/pmem auto on` and `/pmem auto off` while working. Automatic extraction only runs in persistent sessions and skips turns that already wrote memory.
 
-```text
-/pmem                        Show directory, count, revision, and automatic-extraction status
-/pmem list [offset]           Paginate the index
-/pmem show <id>               Show content and provenance
-/pmem forget <id>             Delete the topic and index link; record tombstones
-/pmem auto on|off             Toggle extraction for this session, without changing global settings
-/pmem extract                 Extract unprocessed evidence from the active branch
-```
+To keep the plugin off in one process without uninstalling, pass `--memory-disabled`.
 
-Deleting a topic file also becomes forgetting on the next read, preventing automatic identical-content restoration. Explicitly recreating that Markdown file or saving it again counts as manual restoration. Forget does not erase original sessions, migration backups, or historical provenance quotes in other notes, nor does it recognize arbitrary semantic paraphrases. **It is not privacy-grade secure erasure.**
+## Retrieval, extraction, and limits
 
-## Migrating older stores
+Recall runs on every request:
 
-The first access to an old `memories.json` migrates it automatically: validate all input, generate topic Markdown/index/internal state, preserve a byte-exact `.legacy-memories.json` backup, and remove the old active JSON. Note ids, bodies, descriptions, sources, timestamps, and tombstones survive; revision increases monotonically.
+- The first 200 lines / 3,000 UTF-8 bytes of `MEMORY.md`, plus up to three BM25 snippets of 600 bytes each, within a 6,000-byte total.
+- This is request-local. It does not append to, or rewrite, your stored conversation.
+- Only fixed `project_memory` usage rules are added to the prompt. Your system prompt and `SYSTEM.md` are not replaced.
 
-- Existing Markdown, reserved ids, or damaged legacy JSON stop migration without overwriting or guessing how to merge.
-- Do not run 0.1 and 0.2 writers against one directory. A legacy writer recreating `memories.json` after migration causes a conflict, not silently ignored writes.
-- Missing `.state.json` never triggers resurrection from the migration backup. Restore metadata or resolve the situation manually.
-- Backups retain old content. Review them and session history separately if stronger deletion is needed.
+Search is local BM25 with title weight 3 and description/body weight 1, tokenizing English words and CJK characters/bigrams. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
 
-## Injection, retrieval, extraction, and hard limits
-
-- Only fixed `project_memory` usage rules are appended at runtime. The original system prompt is not replaced and `SYSTEM.md` is not modified. Historical bodies remain untrusted data, not system instructions.
-- The `context` hook includes at most the first 200 lines/3,000 UTF-8 bytes of the actual `MEMORY.md`, plus up to three BM25 snippets of 600 bytes each, **within a 6,000-byte total**. This recall message is request-local, not permanently appended or used to rewrite history. Tool results are recorded normally.
-- BM25 runs locally with title weight 3 and description/body weight 1. It uses English words and CJK character/bigram tokens. Semantic mode asks the current model to select from up to 48 candidate previews; it is not a vector index and may miss older notes or details outside previews.
-- Automatic extraction is off by default. When enabled, each persistent user run makes at most one no-tool model call: a cancellable `turn_end` prepares candidates, and final successful settlement commits them. Runs that directly wrote memory skip redundant extraction. Failed, aborted, or stale-revision candidates are not committed.
-- Extraction uses at most the latest 12 new user/final-assistant texts from the active branch, capped at 1,000 bytes each. System prompts, thinking, tool output, and abandoned branches are excluded. Ephemeral `--no-session` runs do not perform automatic or manual extraction.
+Automatic extraction is off unless you enable it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each). System prompts, thinking, tool output, and abandoned branches are excluded. Failed, aborted, or stale candidates are discarded.
 
 | Resource | Limit |
 |---|---:|
 | Topics per project | 128 |
 | Title / description / body | 160 / 320 / 2,000 UTF-8 bytes |
-| Topic Markdown including frontmatter | 4,096 bytes |
-| MEMORY.md file | 25,000 bytes; excess is an error, not permission to overwrite custom prose |
-| Internal state / legacy JSON | 1 MiB each |
-| Tombstones | 1,024; no automatic eviction |
-| Internal transaction journal | 4 MiB |
+| Topic file including frontmatter | 4,096 bytes |
+| MEMORY.md | 25,000 bytes |
 | Tool output | 12,000 bytes |
-| Nested model input | 32,000-byte hard cap; trimmed to 30,000 beforehand |
-| Nested model output / timeout | 2,000 tokens, 16,000 bytes / 15 seconds |
+| Nested model input / output | 32,000 bytes (trimmed to 30,000) / 16,000 bytes, 2,000 tokens |
+| Nested model timeout | 15 seconds |
 
-Semantic-tool usage is reported through its result and counted by Pi. Automatic/manual extraction usage is recorded separately as `pi-project-memory.extraction` and is not automatically included in footer totals. There is no complete dreaming system: no scheduled full-store consolidation, automatic eviction, or skill generation.
+Semantic-tool usage is reported through the tool result and counted by Pi. Automatic and manual extraction usage is recorded separately as `pi-project-memory.extraction` entries and is not added to Pi's footer totals.
 
-## Consistency and safety
+There is no background "dreaming": no scheduled full-store consolidation, automatic eviction, or skill generation.
 
-- Plugin readers/writers use an in-process queue and a cross-process lock. Individual files are atomically replaced; bounded `.pending.json` records a multi-file transaction before `.state.json` commits last, allowing interrupted work to resume.
-- Recovery stops with the journal intact when an external edit matches neither the transaction's before nor after version. A completed state-last transaction is never replayed over newer manual edits.
-- Uncooperative external editors do not honor the plugin lock. Ordinary file access is not a globally atomic multi-file filesystem transaction. Close affected sessions and preserve the journal and manual edits before resolving conflicts.
-- Crash-left `.lock` files deliberately stop access. Close all Pi sessions using the store, inspect PID/time, then remove only the stale lock. Do not delete `.pending.json` or `.state.json` as a shortcut. Non-conflicting journals recover after the lock is cleared.
-- Path traversal, symlinks, data-file hardlinks, invalid UTF-8, and unknown/damaged state are rejected. New files use `0600`, directories `0700`; Windows follows platform permission semantics.
-- Known credentials are redacted before extraction and obvious credentials are rejected on save. This is not DLP and cannot identify every secret. Memory is not a prompt-injection security boundary; keep automatic extraction off for sensitive conversations.
+## Safety and scope
 
-## Tests and limitations
+- **Not secure erasure.** `/pmem forget` deletes the topic and blocks automatic restoration of that id or identical content. It does not erase your original Pi sessions, migration backups, or historical provenance quotes stored in other notes. Treat deleted facts as recoverable from history.
+- **Memory is untrusted input.** Notes are injected as data, not instructions, and the agent is told current instructions win. Memory is not a prompt-injection boundary: anything written to a note can influence later sessions. Leave automatic extraction off for sensitive conversations.
+- Known credential formats are redacted before extraction, and obvious credentials are rejected when saving. This is not DLP and cannot catch every secret.
+- Writes use an in-process queue plus a cross-process lock, replace each file atomically, and journal multi-file updates with `.state.json` committed last. Uncooperative external editors do not take the lock, so conflicts stop recovery with the journal intact rather than overwriting your newer text.
+- A crash-left `.lock` deliberately blocks access. Close Pi sessions using that store, then inspect and remove only the stale lock. Never delete `.pending.json` or `.state.json` to "fix" a store.
+- Path traversal, symlinks, hardlinked data files, invalid UTF-8, and unknown state are rejected. New files are `0600` and directories `0700` (Windows uses platform semantics).
 
-Repository documentation, comments, executable E2E prompts, and test names are English. Multilingual fixture data uses Unicode escapes so UTF-8/CJK behavior remains covered without non-English repository prose.
-
-Pi 1.2.0 with Node 22.22.3 and 24.18.1 passed **49 tests each**. Source and packaged artifacts also passed a three-process journey: extraction, standard read/edit modification, and cold-session recall.
-
-Coverage includes local Markdown edits/repair, custom index prose, legacy migration and interrupted migration, provenance, forgetting and restoration suppression, stale proposals after external edits, transaction recovery/conflicts, corruption/path limits, and existing retrieval/session behavior. These automated tests use a synthetic provider and isolated data, without importing real history or credentials. Historical logs are `evidence/test-node{22,24}-markdown.log`, `cli-markdown-edit-smoke.json`, and `packed-markdown-edit-smoke.json`. Global Pi configuration/extension-entry fingerprints were unchanged and no default global project-memory store was created.
+## Update and uninstall
 
 ```bash
-npm run check
-npm test
-python3 tests/cli-smoke.py
-PI_MEMORY_TEST_FILE_TOOLS=1 python3 tests/cli-smoke.py
-python3 tests/check-isolation.py # Optional developer-machine before/after audit, not a portable test
+pi update --extensions                                    # update all packages
+pi update git:github.com/adlternative/pi-project-memory   # update this package
+pi remove git:github.com/adlternative/pi-project-memory   # uninstall
 ```
 
-`PI_MEMORY_TEST_NODE` selects Node explicitly. Development dependencies pin Pi/test pi-ai to 1.2.0 and typebox to 1.3.27. `npm ci --ignore-scripts` installs only into this project, not global Pi. Distributed packages still declare host peers and do not bundle development dependencies. Other Pi forks/versions are not guaranteed compatible.
+Add `-l` to update or remove the project-scoped entry. Removing the package does not delete saved memory; delete the `<agent-dir>/project-memory/` directory (or individual projects inside it) when you want the notes gone.
 
-`tests/check-isolation.py` requires a developer-local `evidence/global-pi-before.json` that is not committed. It is not mandatory after a fresh clone. Historical `evidence/` and `.sandbox/` paths exist only on the original developer machine; reruns create new local artifacts.
+## Troubleshooting
 
-A real-model micro-project E2E also passed using `openai-codex/gpt-6.1-sol`: 15 independent process stages, 10 real-model conversations, and 17 acceptance checks. A cold session implemented shipping against previously failing tests (7/7), then exercised updates, semantic retrieval, disabled/cross-project controls, forgetting, and automatic extraction followed by recall. See `e2e/live/README.md` and the local `evidence/live-micro-project.json`. The English-prompt rerun also passed all 17 checks; the live E2E notes preserve the initial ambiguous-query failure and its clarified translation. These are small samples of one model/project, not a broad reliability benchmark.
+**The tools don't appear.** Run `pi list` to confirm the package is installed, then restart Pi or run `/reload`. Note that `--no-extensions` disables configured packages, and `--no-tools` hides the memory tools; explicit `-e <path>` still loads a package.
 
-An additional inspection found old deleted values in another note's historical provenance quote. The tested model did not treat them as current facts, but this does not establish strict forgetting. Linux/Windows runtime and power-loss durability remain unverified. Logs, live E2E development scripts/data, CC-derived sources, REA, caches, credentials, and node_modules are excluded from the plugin package. Nothing has been installed globally.
+**Nothing is recalled.** `/pmem` must show a directory that exists. Memory is per-repository, so a different checkout has its own store. Notes are only recalled when they match; check `/pmem list`.
+
+**Writes stop with a busy or conflict error.** Another Pi process holds the lock, or an external edit conflicted with a pending transaction. Close the other sessions, inspect `.pending.json` and the affected topic, and keep the newer manual edit.
+
+**`/pmem forget` didn't remove everything.** It removes the note from memory. Historical sessions, backups, and provenance quotes in other notes keep it; see [Safety and scope](#safety-and-scope).
+
+## Development
+
+Automated tests use a synthetic in-process provider and isolated data. They never import real history or credentials.
+
+```bash
+npm ci --ignore-scripts
+npm run check
+npm test
+python3 tests/install-smoke.py    # requires PI_CODING_AGENT_DIR
+python3 tests/cli-smoke.py
+PI_MEMORY_TEST_FILE_TOOLS=1 python3 tests/cli-smoke.py
+```
+
+`tests/install-smoke.py` installs, loads, writes, recalls, and removes the package against an isolated `PI_CODING_AGENT_DIR`; it refuses to run against your real global Pi agent directory. Set `PI_MEMORY_TEST_NODE` to pick a specific Node, and `PI_MEMORY_PI_BIN` to pick a Pi launcher.
+
+Try the extension in a throwaway environment without touching your Pi configuration:
+
+```bash
+./run-sandbox.sh
+./run-sandbox.sh --memory-auto
+./run-sandbox.sh --memory-auto -- "Use pnpm rather than npm for this project's future work."
+```
+
+The launcher creates everything under `.sandbox/manual/` and loads the experimental `sandbox-guard.ts`, which restricts file tools to that project's `MEMORY.md` and topic files. Normal installs do not load the guard.
+
+`tests/check-isolation.py` compares global Pi configuration fingerprints and needs a developer-local baseline that is not committed, so it is optional after a fresh clone.
+
+A real-model journey over a disposable Node project is documented in [`e2e/live/README.md`](e2e/live/README.md): 15 process stages, 10 real-model conversations, and 17 acceptance checks, including a cold session implementing a feature against previously failing tests.
+
+### Known limitations
+
+- Developed and tested on macOS with Pi 1.2.0. Linux and Windows are untested.
+- Power-loss durability is not verified.
+- One model and one small project were used for the live journey; it is not a broad reliability benchmark.
+- Forget is not privacy-grade erasure (above).
+- Development dependencies pin Pi/test `pi-ai` 1.2.0 and `typebox` 1.3.27. Distributed packages declare only host peers, and other Pi forks or versions are not guaranteed compatible.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
