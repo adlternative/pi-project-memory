@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFile } from "node:child_process";
-import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { MemoryStore, clip, hash, projectKey, redact, type Draft, type Memory } from "../src/store.ts";
 import { search, tokenize } from "../src/search.ts";
@@ -139,6 +140,55 @@ test("repository common-dir scopes worktrees together, different repos/directori
   assert.notEqual(await projectKey(cwd), await projectKey(sibling));
   const alias = join(root, "alias"); await symlink(cwd, alias);
   assert.equal(await projectKey(cwd), await projectKey(alias));
+
+  // A deep directory inside a linked worktree still has to resolve to the same repo root.
+  const worktreeNested = join(worktree, "deep", "path"); await mkdir(worktreeNested, { recursive: true });
+  assert.equal(await projectKey(cwd), await projectKey(worktreeNested));
+
+  // A worktree checked out from a bare repository belongs to that bare repository.
+  const bare = join(root, "bare.git");
+  await promisify(execFile)("git", ["clone", "-q", "--bare", cwd, bare], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  await promisify(execFile)("git", ["worktree", "add", "-q", join(root, "from-bare")], { cwd: bare, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  assert.equal(await projectKey(bare), await projectKey(join(root, "from-bare")));
+
+  // A submodule is a separate repository, so it keeps its own memory.
+  const library = join(root, "library");
+  await promisify(execFile)("git", ["init", "-q", "-b", "main", library], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  await promisify(execFile)("git", ["-c", "user.name=Memory Test", "-c", "user.email=memory@example.invalid", "commit", "--allow-empty", "-q", "-m", "library"], { cwd: library, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  await promisify(execFile)("git", ["-c", "protocol.file.allow=always", "-c", "user.name=Memory Test", "-c", "user.email=memory@example.invalid", "submodule", "add", "-q", library, "vendor/lib"], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  assert.notEqual(await projectKey(cwd), await projectKey(join(cwd, "vendor", "lib")));
+});
+
+test("inherited GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR cannot split memory across a worktree", async t => {
+  const { root } = await fixture(t);
+  const cwd = join(root, "repo"); const worktree = join(root, "worktree");
+  await mkdir(cwd);
+  const git = (...args: string[]) => promisify(execFile)("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  await git("init", "-b", "main");
+  await git("-c", "user.name=Memory Test", "-c", "user.email=memory@example.invalid", "commit", "--allow-empty", "-m", "test");
+  await git("worktree", "add", "-b", "polluted", worktree);
+  const expected = await projectKey(worktree);
+
+  // Run the real resolver in a fresh process, as git hooks or an exported shell variable would.
+  const entry = pathToFileURL(resolve("src/store.ts")).href;
+  const child = async (env: NodeJS.ProcessEnv) => {
+    const { stdout } = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `import {projectKey} from ${JSON.stringify(entry)}; console.log(await projectKey(${JSON.stringify(worktree)}))`], { env: { ...process.env, ...env }, timeout: 60_000 });
+    return stdout.trim();
+  };
+  for (const polluted of [{ GIT_DIR: join(root, "elsewhere", ".git") }, { GIT_WORK_TREE: root }, { GIT_COMMON_DIR: join(root, "elsewhere") }]) {
+    assert.equal(await child(polluted), expected, `unexpected split for ${JSON.stringify(polluted)}`);
+  }
+});
+
+test("moving a repository changes its path-derived key, so memory must be migrated deliberately", async t => {
+  const { root } = await fixture(t);
+  const cwd = join(root, "repo"); const moved = join(root, "renamed");
+  await mkdir(cwd);
+  await promisify(execFile)("git", ["init", "-q", "-b", "main", cwd], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  const before = await projectKey(cwd);
+  await rename(cwd, moved);
+  // Documented behavior: the store stays on disk under the old key and the new path starts empty.
+  assert.notEqual(await projectKey(moved), before);
 });
 
 test("UTF-8 caps and redaction cover multilingual text and known credential shapes", () => {

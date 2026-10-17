@@ -124,7 +124,11 @@ Structured tool output is `{directory,indexPath,notes,truncated,nextOffset}`; ea
 
 `<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise. Override the base directory with `--memory-dir /absolute/path`; projects remain separated underneath it.
 
-The canonical Git common directory identifies a project, so all worktrees, subdirectories, and sessions of one repository share memory. Non-Git directories use their canonical working directory. Nothing is pooled across unrelated projects.
+The canonical Git common directory identifies a project, resolved automatically with no configuration: every worktree, subdirectory, and symlinked checkout of one repository shares a single memory store. Worktrees checked out from a bare repository behave the same way. Inherited `GIT_DIR`, `GIT_WORK_TREE`, or `GIT_COMMON_DIR` values are ignored during resolution so an exported variable or git hook cannot silently give a worktree its own separate memory.
+
+A git submodule is its own repository and therefore gets its own store. Non-Git directories use their canonical working directory. Nothing is pooled across unrelated projects. Session transcripts are separate from memory and remain per working directory, so each worktree has its own conversation history but they all read and write the same notes.
+
+Renaming or moving a repository changes the path-derived key. The old notes stay on disk untouched; run `/pmem` in the moved checkout to print the new directory, then move the old project directory to that location while the new one does not yet exist.
 
 ### Editing a topic by hand
 
@@ -164,6 +168,8 @@ Add your own navigation guidance here.
 | `--memory-dir <path>` | Base directory for all project stores |
 | `--memory-auto` | Enable automatic extraction for this run (opt-in, uses extra model calls) |
 | `--memory-disabled` | Disable reads, writes, and nested model calls for this process |
+
+Worktree and subdirectory root detection needs no flag; see [Where memory lives](#where-memory-lives).
 
 `--memory-auto` covers the whole session, since it is a process flag. Use `/pmem auto on` and `/pmem auto off` while working. Automatic extraction only runs in persistent sessions and skips turns that already wrote memory.
 
@@ -259,6 +265,7 @@ A real-model journey over a disposable Node project is documented in [`e2e/live/
 - Power-loss durability is not verified.
 - One model and one small project were used for the live journey; it is not a broad reliability benchmark.
 - Forget is not privacy-grade erasure (above).
+- Renaming or moving a repository starts a new store at the new path; migrate the old directory manually (see [Where memory lives](#where-memory-lives)).
 - Development dependencies pin Pi/test `pi-ai` 1.2.0 and `typebox` 1.3.27. Distributed packages declare only host peers, and other Pi forks or versions are not guaranteed compatible.
 
 ## License

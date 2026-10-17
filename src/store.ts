@@ -30,11 +30,26 @@ function validateDisk(value: unknown): DiskState {
 
 export async function projectKey(cwd: string): Promise<string> {
   let identity = await realpath(cwd);
-  try {
-    const { stdout } = await promisify(execFile)("git", ["rev-parse", "--git-common-dir"], { cwd: identity, timeout: 2000, maxBuffer: 8192 });
-    identity = await realpath(resolve(identity, stdout.trim()));
-  } catch { /* Non-Git directories remain isolated by canonical cwd. */ }
+  const common = await gitCommonDir(identity);
+  if (common) {
+    const resolved = resolve(identity, common);
+    // Symlinked checkouts and worktrees must land on one canonical key.
+    identity = await realpath(resolved).catch(() => resolved);
+  }
   return hash(identity).slice(0, 24);
+}
+
+// These redirect git at another repository. Inherited from a hook or an export, they make a
+// worktree resolve to nothing, which would silently split its memory from the main checkout.
+const GIT_LOCATION_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"];
+
+async function gitCommonDir(cwd: string): Promise<string | null> {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of GIT_LOCATION_ENV) delete env[name];
+  try {
+    const { stdout } = await promisify(execFile)("git", ["rev-parse", "--git-common-dir"], { cwd, env, timeout: 2000, maxBuffer: 8192 });
+    return stdout.trim() || null;
+  } catch { /* Non-Git directories remain isolated by canonical cwd. */ return null; }
 }
 
 /** Topic Markdown is authoritative; the hidden JSON stores only provenance and coordination metadata. */
