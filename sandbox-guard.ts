@@ -2,7 +2,7 @@ import { resolve, relative } from "node:path";
 import { lstat } from "node:fs/promises";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { MemoryFiles } from "./src/files.ts";
-import { projectKey } from "./src/store.ts";
+import { MemoryStore, projectIdentity } from "./src/store.ts";
 import { validId } from "./src/model.ts";
 
 /** Only lab sessions load this. A missing root fails closed, not an unguarded file-tool session. */
@@ -11,7 +11,8 @@ export function createMemorySandboxGuard(root?: string): ExtensionFactory {
     pi.on("tool_call", async (event, ctx) => {
       if (["pmem_list", "pmem_read", "pmem_search", "pmem_save"].includes(event.toolName)) return;
       if (!root || !["read", "edit", "write"].includes(event.toolName) || !("path" in event.input) || typeof event.input.path !== "string") return { block: true, reason: "The memory lab only permits memory tools and topic Markdown read/edit/write" };
-      const files = new MemoryFiles(resolve(ctx.cwd, root, await projectKey(ctx.cwd)));
+      const identity = await projectIdentity(ctx.cwd);
+      const files = new MemoryFiles(new MemoryStore(resolve(ctx.cwd, root), identity.key, identity.name).dir);
       const name = relative(files.dir, resolve(ctx.cwd, event.input.path));
       if (name !== "MEMORY.md" && !(name.endsWith(".md") && validId(name.slice(0, -3)))) return { block: true, reason: "Sandbox file tools are restricted to current-project MEMORY.md and topic .md files" };
       if (await files.directory(false)) {

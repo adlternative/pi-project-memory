@@ -12,7 +12,7 @@ const markdown = (body = "Use pnpm to install dependencies.") => `---\nname: Pac
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const root = await mkdtemp(resolve(".sandbox", "markdown-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const store = new MemoryStore(root, hash("project").slice(0, 24));
+  const store = new MemoryStore(root, hash("project").slice(0, 24), "project");
   await mkdir(store.dir, { recursive: true, mode: 0o700 });
   return { root, store };
 }

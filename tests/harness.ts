@@ -8,7 +8,7 @@ import {
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { MemoryStore, projectKey } from "../src/store.ts";
+import { MemoryStore, projectIdentity } from "../src/store.ts";
 import { createMemorySandboxGuard } from "../sandbox-guard.ts";
 
 export interface Request { kind: "main" | "extract" | "semantic"; context: TranscriptContext; options?: SimpleStreamOptions; data?: any }
@@ -92,7 +92,8 @@ export async function makeHarness(t: { after(fn: () => Promise<void>): void }, o
     session.dispose();
     if (!options.root) await rm(root, { recursive: true, force: true });
   });
-  return { root, cwd, agentDir, memoryDir, session, manager, requests, errors, store: new MemoryStore(memoryDir, await projectKey(cwd)) };
+  const identity = await projectIdentity(cwd);
+  return { root, cwd, agentDir, memoryDir, identity, session, manager, requests, errors, store: new MemoryStore(memoryDir, identity.key, identity.name) };
 }
 
 export function extraction(request: Request, content = "Use pnpm, not npm, to install dependencies.") {

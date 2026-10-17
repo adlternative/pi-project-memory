@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { Type } from "typebox";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { MemoryFiles } from "../../src/files.ts";
-import { clip, projectKey } from "../../src/store.ts";
+import { clip, projectIdentity } from "../../src/store.ts";
 import { validId } from "../../src/model.ts";
 
 /** Tests run read-only, without network or fork. The parent Pi alone can edit the approved source file. */
@@ -40,7 +40,8 @@ export function liveEnvironment(options: { project: string; memoryBase: string; 
       const projectFile = relative(options.project, target);
       let allowed = event.toolName === "read" ? ["quote.js", "quote.test.js", "package.json", "README.md"].includes(projectFile) : options.editSource && projectFile === "quote.js";
       if (!allowed) {
-        const files = new MemoryFiles(join(options.memoryBase, await projectKey(ctx.cwd)));
+        const identity = await projectIdentity(ctx.cwd);
+        const files = new MemoryFiles(new MemoryStore(options.memoryBase, identity.key, identity.name).dir);
         const name = relative(files.dir, target);
         allowed = name === "MEMORY.md" || (name.endsWith(".md") && validId(name.slice(0, -3)));
         if (allowed) await files.directory(false);

@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFile } from "node:child_process";
 import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { MemoryStore, clip, hash, projectKey, redact, type Draft, type Memory } from "../src/store.ts";
+import { MemoryStore, clip, hash, projectIdentity, projectKey, redact, type Draft, type Memory } from "../src/store.ts";
 import { search, tokenize } from "../src/search.ts";
 import { parseExtraction } from "../src/intelligence.ts";
 import { renderIndex } from "../src/markdown.ts";
@@ -19,7 +19,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
   await mkdir(resolve(".sandbox"), { recursive: true });
   const root = await mkdtemp(resolve(".sandbox", "core-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  return { root, store: new MemoryStore(root, hash("project-a").slice(0, 24)) };
+  return { root, store: new MemoryStore(root, hash("project-a").slice(0, 24), "project-a") };
 }
 
 test("canonical saves, updates, provenance and deduplication survive a cold read", async t => {
@@ -34,14 +34,14 @@ test("canonical saves, updates, provenance and deduplication survive a cold read
   assert.equal(same.id, saved.id);
   assert.equal((await store.read()).notes.length, 1);
   await store.save([draft("package-manager", "Use bun for this project instead.")]);
-  const cold = new MemoryStore(resolve(store.dir, ".."), hash("project-a").slice(0, 24));
+  const cold = new MemoryStore(resolve(store.dir, ".."), hash("project-a").slice(0, 24), "project-a");
   assert.deepEqual(await cold.read(), await store.read());
   assert.equal((await cold.read()).notes[0].createdAt, saved.createdAt);
 });
 
 test("parallel writers serialize complete read-modify-write transactions", async t => {
   const { root, store } = await fixture(t);
-  const other = new MemoryStore(root, hash("project-a").slice(0, 24));
+  const other = new MemoryStore(root, hash("project-a").slice(0, 24), "project-a");
   await Promise.all(Array.from({ length: 20 }, (_, i) => (i % 2 ? store : other).save([draft("note-" + i, "A distinct fact number " + i)])));
   const state = await store.read();
   assert.equal(state.revision, 20);
@@ -235,4 +235,45 @@ test("extraction validates evidence, role, duplicate ids, secret text and unknow
     { ...memory, content: "token=" + "x".repeat(30) },
   ]) assert.throws(() => parseExtraction({ memories: [item] }, evidence, "session"));
   assert.throws(() => parseExtraction({ memories: [memory, memory] }, evidence, "session"));
+});
+
+test("project folders are readable but the hash stays authoritative", async t => {
+  const { root } = await fixture(t);
+  const cwd = join(root, "My Repo!"); await mkdir(cwd);
+  await promisify(execFile)("git", ["init", "-q", "-b", "main", cwd], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  const identity = await projectIdentity(cwd);
+  assert.equal(identity.name, "my-repo");
+  assert.match(identity.key, /^[a-f0-9]{24}$/);
+
+  const store = new MemoryStore(root, identity.key, identity.name);
+  await store.save([draft()]);
+  assert.equal(basename(store.dir), `my-repo__${identity.key.slice(0, 12)}`);
+
+  const worktree = join(root, "wt");
+  await promisify(execFile)("git", ["worktree", "add", "-q", "-b", "feat", worktree], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  assert.deepEqual(await projectIdentity(worktree), identity);
+
+  // Two paths that Pi's session encoding cannot tell apart must not share memory.
+  const lookalike = join(root, "My-Repo");
+  await mkdir(lookalike);
+  await promisify(execFile)("git", ["init", "-q", "-b", "main", lookalike], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  const other = await projectIdentity(lookalike);
+  assert.equal(other.name, identity.name);
+  assert.notEqual(other.key, identity.key);
+  assert.notEqual(new MemoryStore(root, other.key, other.name).dir, store.dir);
+});
+
+test("a hash-only folder from an earlier version is renamed in place, keeping its notes", async t => {
+  const { root } = await fixture(t);
+  const key = hash("legacy-project").slice(0, 24);
+  const legacy = new MemoryStore(root, key);
+  await legacy.save([draft()]);
+  assert.equal(basename(legacy.dir), key);
+
+  const named = new MemoryStore(root, key, "legacy-project");
+  const state = await named.read();
+  assert.equal(state.notes.length, 1);
+  assert.equal(basename(named.dir), `legacy-project__${key.slice(0, 12)}`);
+  await assert.rejects(readdir(legacy.dir), /ENOENT/);
+  assert.deepEqual((await named.read()).notes, state.notes);
 });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { MemoryStore, projectKey } from "../../src/store.ts";
+import { MemoryStore, projectIdentity } from "../../src/store.ts";
 import { readonlyRuntime } from "./auth.ts";
 import { liveEnvironment, runProjectTests, sandboxProfile } from "./environment.ts";
 
@@ -72,7 +72,8 @@ if (stage.name === "project-baseline" || stage.name === "project-red" || stage.n
     const last = assistant.at(-1);
     assert.ok(!timedOut && (stage.mode === "forget" || last?.stopReason === "stop"), "Live phase did not finish normally");
     assert.deepEqual(errors, []);
-    const memory = new MemoryStore(memoryBase, await projectKey(project));
+    const identity = await projectIdentity(project);
+    const memory = new MemoryStore(memoryBase, identity.key, identity.name);
     const state = await memory.read();
     const extractions = manager.getEntries().flatMap(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction" ? [entry.data] : []);
     const mainUsage = assistant.map(message => message.usage);

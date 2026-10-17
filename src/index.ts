@@ -2,7 +2,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { clip, MemoryStore, projectKey, TYPES, type Memory } from "./store.ts";
+import { clip, MemoryStore, projectIdentity, TYPES, type Memory } from "./store.ts";
 import { search } from "./search.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
@@ -72,7 +72,8 @@ export default function projectMemory(pi: ExtensionAPI) {
     if (!enabled()) throw new Error("Project memory is disabled for this process");
     if (!store || workspace !== ctx.cwd) {
       const root = rootFor(ctx.cwd);
-      store = new MemoryStore(root, await projectKey(ctx.cwd));
+      const identity = await projectIdentity(ctx.cwd);
+      store = new MemoryStore(root, identity.key, identity.name);
       workspace = ctx.cwd;
     }
     return store;

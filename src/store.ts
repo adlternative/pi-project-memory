@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { join, resolve } from "node:path";
-import { realpath } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { lstat, realpath, rename } from "node:fs/promises";
 import { promisify } from "node:util";
 import { MemoryFiles, type Change, type FileText } from "./files.ts";
 import { parseTopic, renderIndex, renderTopic } from "./markdown.ts";
@@ -28,15 +28,32 @@ function validateDisk(value: unknown): DiskState {
   return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash };
 }
 
+export interface ProjectIdentity { key: string; name: string }
+
+const NAME_MAX = 48;
+function slugName(value: string): string {
+  const slug = value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^[-.]+|[-.]+$/g, "").slice(0, NAME_MAX).replace(/[-.]+$/g, "");
+  return slug || "project";
+}
+
+/**
+ * The hash identifies the project; the readable name is only a label.
+ *
+ * Pi's session and CC's memory folders collapse separators into "-", so /a/b and /a-b encode
+ * identically. A pure slug would merge two projects, so the hash stays authoritative here.
+ */
+export async function projectIdentity(cwd: string): Promise<ProjectIdentity> {
+  const canonical = await realpath(cwd);
+  const common = await gitCommonDir(canonical);
+  const root = common
+    ? await realpath(resolve(canonical, common)).catch(() => resolve(canonical, common))
+    : canonical;
+  const base = common ? (basename(root) === ".git" ? basename(dirname(root)) : basename(root).replace(/\.git$/, "")) : basename(canonical);
+  return { key: hash(root).slice(0, 24), name: slugName(base) };
+}
+
 export async function projectKey(cwd: string): Promise<string> {
-  let identity = await realpath(cwd);
-  const common = await gitCommonDir(identity);
-  if (common) {
-    const resolved = resolve(identity, common);
-    // Symlinked checkouts and worktrees must land on one canonical key.
-    identity = await realpath(resolved).catch(() => resolved);
-  }
-  return hash(identity).slice(0, 24);
+  return (await projectIdentity(cwd)).key;
 }
 
 // These redirect git at another repository. Inherited from a hook or an export, they make a
@@ -57,10 +74,13 @@ export class MemoryStore {
   readonly dir: string;
   readonly file: string;
   readonly indexFile: string;
+  private readonly legacyDir: string;
   private readonly files: MemoryFiles;
-  constructor(root: string, key: string) {
+  constructor(root: string, key: string, name: string = key) {
     if (!/^[a-f0-9]{24}$/.test(key)) throw new Error("Invalid project key");
-    this.dir = join(resolve(root), key);
+    const base = resolve(root);
+    this.legacyDir = join(base, key);
+    this.dir = name === key ? this.legacyDir : join(base, `${slugName(name)}__${key.slice(0, 12)}`);
     this.file = join(this.dir, ".state.json");
     this.indexFile = join(this.dir, "MEMORY.md");
     this.files = new MemoryFiles(this.dir);
@@ -129,7 +149,17 @@ export class MemoryStore {
     return loaded;
   }
 
+  /** Hash-only folders from earlier versions are renamed in place, never copied or merged. */
+  private async adoptLegacyDir(): Promise<void> {
+    if (this.dir === this.legacyDir) return;
+    if (await this.files.directory(false)) return;
+    const legacy = await lstat(this.legacyDir).catch(() => undefined);
+    if (!legacy?.isDirectory() || legacy.isSymbolicLink()) return;
+    await rename(this.legacyDir, this.dir).catch(error => { if (error.code !== "ENOENT" && error.code !== "EEXIST") throw error; });
+  }
+
   async read(): Promise<State> {
+    await this.adoptLegacyDir();
     if (!await this.files.directory(false)) return emptyState();
     return this.files.locked(async () => (await this.load()).state);
   }
@@ -137,6 +167,7 @@ export class MemoryStore {
   async save(drafts: Draft[], options: { automatic?: boolean; expectedRevision?: number; signal?: AbortSignal } = {}): Promise<Memory[]> {
     if (drafts.length > 4) throw new Error("At most four memories per save");
     const validated = drafts.map(draft => ({ ...validateInput(draft), source: validateSource(draft.source) }));
+    await this.adoptLegacyDir();
     return this.files.locked(async () => {
       const loaded = await this.load();
       if (options.expectedRevision !== undefined && loaded.state.revision !== options.expectedRevision) throw new Error("Memory changed during extraction; stale result discarded");
@@ -165,6 +196,7 @@ export class MemoryStore {
 
   async forget(id: string): Promise<void> {
     if (!validId(id)) throw new Error("Invalid memory id");
+    await this.adoptLegacyDir();
     await this.files.locked(async () => {
       const loaded = await this.load();
       const note = loaded.state.notes.find(note => note.id === id);

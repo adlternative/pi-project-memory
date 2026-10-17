@@ -114,13 +114,15 @@ Structured tool output is `{directory,indexPath,notes,truncated,nextOffset}`; ea
 ## Where memory lives
 
 ```text
-<agent-dir>/project-memory/<project-hash>/
+<agent-dir>/project-memory/<repo-name>__<hash>/
 ├── MEMORY.md              # Navigation; your own prose outside the generated block is kept
 ├── package-manager.md     # One topic; the filename is its stable id
 ├── review-process.md
 ├── .state.json            # Revision, provenance, timestamps, hashes, tombstones
 └── .pending.json          # Only during a transaction or interrupted recovery
 ```
+
+Folder names read like `codex__646b6ecb79c8`, where the hash keeps identity unique. Pi's own session folders collapse `/` into `-`, so `/a/b` and `/a-b` would share a folder; that is acceptable for transcripts but not for notes, so the hash decides and the name is only a label. Folders created by earlier versions (hash only) are renamed in place on first use, keeping their notes.
 
 `<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise. Change the base directory with `projectMemory.directory` in settings, or `--memory-dir` for one run; projects remain separated underneath it.
 

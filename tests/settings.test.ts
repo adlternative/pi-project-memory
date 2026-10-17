@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readdir } from "node:fs/promises";
-import { MemoryStore, projectKey } from "../src/store.ts";
+import { MemoryStore, projectIdentity } from "../src/store.ts";
 import { makeHarness, tool } from "./harness.ts";
 
 const note = { id: "package-manager", type: "feedback" as const, title: "Package manager", content: "Use pnpm, not npm, to install dependencies." };
@@ -19,7 +19,7 @@ test("settings decide the memory directory and expand a leading ~/", async t => 
   const base = "~/pi-memory-settings-test";
   const h = await makeHarness(t, { useFlags: false, settings: { projectMemory: { directory: base } } });
   await h.session.prompt("/pmem");
-  const expected = join(homedir(), "pi-memory-settings-test", await projectKey(h.cwd));
+  const expected = h.store.dir.replace(h.memoryDir, join(homedir(), "pi-memory-settings-test"));
   assert.equal(lastReport(h).directory, expected);
   // Reading config must not create anything in the home directory.
   await assert.rejects(readdir(join(homedir(), "pi-memory-settings-test")), /ENOENT/);
@@ -28,7 +28,7 @@ test("settings decide the memory directory and expand a leading ~/", async t => 
 test("a per-run flag still overrides the persisted setting", async t => {
   const h = await makeHarness(t, { settings: { projectMemory: { directory: join(homedir(), "ignored-dir") } } });
   await h.session.prompt("/pmem");
-  assert.equal(lastReport(h).directory, join(h.memoryDir, await projectKey(h.cwd)));
+  assert.equal(lastReport(h).directory, h.store.dir);
 });
 
 test("a relative settings directory is rejected instead of silently landing somewhere", async t => {
@@ -46,7 +46,8 @@ test("enabled:false disables recall, writes and extraction without touching stor
     settings: { projectMemory: { enabled: false, directory: dir, autoExtract: true } },
     answer: () => (++step === 1 ? tool("pmem_save", note) : "Done."),
   });
-  const store = new MemoryStore(dir, await projectKey(h.cwd));
+  const identity = await projectIdentity(h.cwd);
+  const store = new MemoryStore(dir, identity.key, identity.name);
   await store.save([{ ...note, source }]);
   const before = (await store.read()).revision;
   await h.session.prompt("Please remember to keep using pnpm here.");
