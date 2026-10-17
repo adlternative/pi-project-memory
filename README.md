@@ -122,7 +122,7 @@ Structured tool output is `{directory,indexPath,notes,truncated,nextOffset}`; ea
 └── .pending.json          # Only during a transaction or interrupted recovery
 ```
 
-`<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise. Override the base directory with `--memory-dir /absolute/path`; projects remain separated underneath it.
+`<agent-dir>` is `~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise. Change the base directory with `projectMemory.directory` in settings, or `--memory-dir` for one run; projects remain separated underneath it.
 
 The canonical Git common directory identifies a project, resolved automatically with no configuration: every worktree, subdirectory, and symlinked checkout of one repository shares a single memory store. Worktrees checked out from a bare repository behave the same way. Inherited `GIT_DIR`, `GIT_WORK_TREE`, or `GIT_COMMON_DIR` values are ignored during resolution so an exported variable or git hook cannot silently give a worktree its own separate memory.
 
@@ -163,17 +163,39 @@ Add your own navigation guidance here.
 
 ## Configuration
 
-| Flag | Effect |
+Configure memory in Pi settings, so it applies to every session after installation instead of being repeated on each launch. Use user scope for everything (`~/.pi/agent/settings.json`), or project scope (`.pi/settings.json`, applied once you trust the folder) to change one repository.
+
+```json
+{
+  "projectMemory": {
+    "enabled": true,
+    "directory": "~/pi-memory",
+    "autoExtract": false
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Master switch. `false` stops recall, writes, and extraction without deleting saved notes |
+| `directory` | `<agent-dir>/project-memory` | Base directory for all project stores. Absolute, or starting with `~/` |
+| `autoExtract` | `false` | Opt in to one bounded extraction call after a successful persistent turn |
+
+These are the counterpart of Claude Code's `autoMemoryEnabled` and `autoMemoryDirectory`. Run `/reload` after editing settings; `/pmem` confirms the resolved directory and state.
+
+Worktree and subdirectory root detection needs no configuration; see [Where memory lives](#where-memory-lives).
+
+### Per-run overrides
+
+You normally do not need these. They exist for one-off experiments, tests, and subagent or automation processes that must not share the installed configuration.
+
+| Flag | Overrides |
 |---|---|
-| `--memory-dir <path>` | Base directory for all project stores |
-| `--memory-auto` | Enable automatic extraction for this run (opt-in, uses extra model calls) |
-| `--memory-disabled` | Disable reads, writes, and nested model calls for this process |
+| `--memory-dir <path>` | `projectMemory.directory` |
+| `--memory-auto` | `projectMemory.autoExtract` |
+| `--memory-disabled` | `projectMemory.enabled` (forces off) |
 
-Worktree and subdirectory root detection needs no flag; see [Where memory lives](#where-memory-lives).
-
-`--memory-auto` covers the whole session, since it is a process flag. Use `/pmem auto on` and `/pmem auto off` while working. Automatic extraction only runs in persistent sessions and skips turns that already wrote memory.
-
-To keep the plugin off in one process without uninstalling, pass `--memory-disabled`.
+Precedence is flag, then settings, then default. A flag affects only the process it is passed to. `/pmem auto on` and `/pmem auto off` toggle extraction for the current session only and never edit settings.
 
 ## Retrieval, extraction, and limits
 
@@ -185,7 +207,7 @@ Recall runs on every request:
 
 Search is local BM25 with title weight 3 and description/body weight 1, tokenizing English words and CJK characters/bigrams. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
 
-Automatic extraction is off unless you enable it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each). System prompts, thinking, tool output, and abandoned branches are excluded. Failed, aborted, or stale candidates are discarded.
+Automatic extraction is off unless `projectMemory.autoExtract` (or `--memory-auto`) enables it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each). System prompts, thinking, tool output, and abandoned branches are excluded. Failed, aborted, or stale candidates are discarded.
 
 | Resource | Limit |
 |---|---:|

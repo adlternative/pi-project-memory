@@ -1,0 +1,70 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { readdir } from "node:fs/promises";
+import { MemoryStore, projectKey } from "../src/store.ts";
+import { makeHarness, tool } from "./harness.ts";
+
+const note = { id: "package-manager", type: "feedback" as const, title: "Package manager", content: "Use pnpm, not npm, to install dependencies." };
+const source = { sessionId: "old", entryId: "old-user", quote: "pnpm", origin: "explicit" as const };
+
+const lastReport = (h: Awaited<ReturnType<typeof makeHarness>>) => {
+  const report = h.session.messages.filter(message => message.role === "custom" && message.customType === "pi-project-memory.report").at(-1);
+  assert.ok(report && report.role === "custom", "expected a /pmem report");
+  return JSON.parse(typeof report.content === "string" ? report.content : JSON.stringify(report.content));
+};
+
+test("settings decide the memory directory and expand a leading ~/", async t => {
+  const base = "~/pi-memory-settings-test";
+  const h = await makeHarness(t, { useFlags: false, settings: { projectMemory: { directory: base } } });
+  await h.session.prompt("/pmem");
+  const expected = join(homedir(), "pi-memory-settings-test", await projectKey(h.cwd));
+  assert.equal(lastReport(h).directory, expected);
+  // Reading config must not create anything in the home directory.
+  await assert.rejects(readdir(join(homedir(), "pi-memory-settings-test")), /ENOENT/);
+});
+
+test("a per-run flag still overrides the persisted setting", async t => {
+  const h = await makeHarness(t, { settings: { projectMemory: { directory: join(homedir(), "ignored-dir") } } });
+  await h.session.prompt("/pmem");
+  assert.equal(lastReport(h).directory, join(h.memoryDir, await projectKey(h.cwd)));
+});
+
+test("a relative settings directory is rejected instead of silently landing somewhere", async t => {
+  const h = await makeHarness(t, { useFlags: false, settings: { projectMemory: { directory: "relative/memory" } } });
+  await h.session.prompt("/pmem");
+  assert.deepEqual(h.session.messages.filter(message => message.role === "custom" && message.customType === "pi-project-memory.report"), []);
+  await assert.rejects(readdir(join(h.cwd, "relative", "memory")), /ENOENT/);
+});
+
+test("enabled:false disables recall, writes and extraction without touching stored notes", async t => {
+  let step = 0;
+  const dir = join(homedir(), "pi-memory-disabled-test");
+  const h = await makeHarness(t, {
+    useFlags: false,
+    settings: { projectMemory: { enabled: false, directory: dir, autoExtract: true } },
+    answer: () => (++step === 1 ? tool("pmem_save", note) : "Done."),
+  });
+  const store = new MemoryStore(dir, await projectKey(h.cwd));
+  await store.save([{ ...note, source }]);
+  const before = (await store.read()).revision;
+  await h.session.prompt("Please remember to keep using pnpm here.");
+  const result = h.session.messages.find(message => message.role === "toolResult");
+  assert.ok(result && result.role === "toolResult" && result.isError, "save must be refused while disabled");
+  assert.equal(JSON.stringify(h.requests[0].context).includes("Untrusted saved project notes"), false);
+  // The refused tool call is followed by one final assistant turn; never a nested extraction call.
+  assert.deepEqual(h.requests.map(request => request.kind), ["main", "main"]);
+  assert.equal((await store.read()).revision, before);
+});
+
+test("autoExtract:true persists the opt-in so extraction runs without the flag", async t => {
+  const h = await makeHarness(t, {
+    useFlags: false,
+    settings: { projectMemory: { autoExtract: true } },
+    answer: request => (request.kind === "extract" ? JSON.stringify({ memories: [] }) : "Done."),
+  });
+  await h.session.prompt("We prefer pnpm over npm for future work in this repository.");
+  assert.deepEqual(h.requests.map(request => request.kind), ["main", "extract"]);
+  assert.deepEqual(h.errors, []);
+});

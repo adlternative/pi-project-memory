@@ -55,6 +55,7 @@ export function syntheticStream(model: Model<string>, context: TranscriptContext
 
 export async function makeHarness(t: { after(fn: () => Promise<void>): void }, options: {
   root?: string; project?: string; auto?: boolean; disabled?: boolean; persistent?: boolean; fileTools?: boolean;
+  settings?: Record<string, unknown>; useFlags?: boolean;
   sessionManager?: SessionManager; answer?: (request: Request) => Reply | Promise<Reply>;
 } = {}) {
   await mkdir(resolve(".sandbox"), { recursive: true });
@@ -69,15 +70,18 @@ export async function makeHarness(t: { after(fn: () => Promise<void>): void }, o
     models: [{ id: "synthetic", name: "Synthetic memory test", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
     streamSimple: (model, context, settings) => syntheticStream(model, context, settings, options.answer ?? (() => "Done."), requests),
   });
-  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off", defaultProjectTrust: "never", enableInstallTelemetry: false });
+  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off", defaultProjectTrust: "never", enableInstallTelemetry: false, ...options.settings } as never);
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, additionalExtensionPaths: [resolve("src/index.ts")], extensionFactories: options.fileTools ? [createMemorySandboxGuard(memoryDir)] : [], noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
   await loader.reload();
   const loaded = loader.getExtensions();
   assert.deepEqual(loaded.errors, []);
   assert.equal(loaded.extensions.length, options.fileTools ? 2 : 1);
-  loaded.runtime.flagValues.set("memory-dir", memoryDir);
-  loaded.runtime.flagValues.set("memory-auto", options.auto ?? false);
-  loaded.runtime.flagValues.set("memory-disabled", options.disabled ?? false);
+  // Flags are per-run overrides; settings tests leave them unset to exercise the persisted path.
+  if (options.useFlags !== false) {
+    loaded.runtime.flagValues.set("memory-dir", memoryDir);
+    if (options.auto !== undefined) loaded.runtime.flagValues.set("memory-auto", options.auto);
+    if (options.disabled !== undefined) loaded.runtime.flagValues.set("memory-disabled", options.disabled);
+  }
   const manager = options.sessionManager ?? (options.persistent === false ? SessionManager.inMemory(cwd) : SessionManager.create(cwd, join(agentDir, "sessions")));
   const model = runtime.getModel("memory-test", "synthetic"); assert.ok(model);
   const { session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model, thinkingLevel: "off", resourceLoader: loader, sessionManager: manager, settingsManager: settings, ...(options.fileTools ? { tools: ["pmem_*", "read", "edit", "write"] } : { noTools: "builtin" as const }) });

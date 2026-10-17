@@ -1,4 +1,5 @@
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { clip, MemoryStore, projectKey, TYPES, type Memory } from "./store.ts";
@@ -29,10 +30,27 @@ function result(memory: MemoryStore, notes: Memory[], truncated = false, nextOff
   return { content: [{ type: "text" as const, text: content }], details: data, structuredContent: data };
 }
 
+export interface MemorySettings { enabled: boolean; directory?: string; autoExtract: boolean }
+
+/** Configuration lives in Pi settings so it survives installs, like CC's autoMemory* keys. */
+function readSettings(pi: ExtensionAPI): MemorySettings {
+  const section = (pi.getSettings() as unknown as Record<string, unknown>).projectMemory;
+  const value = typeof section === "object" && section !== null ? section as Record<string, unknown> : {};
+  const directory = typeof value.directory === "string" && value.directory.trim() ? value.directory.trim() : undefined;
+  return { enabled: value.enabled !== false, directory, autoExtract: value.autoExtract === true };
+}
+
+function expandDirectory(directory: string): string {
+  if (directory === "~") return homedir();
+  if (directory.startsWith("~/")) return join(homedir(), directory.slice(2));
+  if (!isAbsolute(directory)) throw new Error("projectMemory.directory must be absolute or start with ~/");
+  return directory;
+}
+
 export default function projectMemory(pi: ExtensionAPI) {
-  pi.registerFlag("memory-dir", { type: "string", description: "Memory base directory (each project gets a separate hashed subdirectory)" });
-  pi.registerFlag("memory-auto", { type: "boolean", default: false, description: "Opt in to one bounded memory extraction call after successful persistent user runs" });
-  pi.registerFlag("memory-disabled", { type: "boolean", default: false, description: "Disable this extension's reads, writes and nested calls for this process" });
+  pi.registerFlag("memory-dir", { type: "string", description: "Override projectMemory.directory for this run" });
+  pi.registerFlag("memory-auto", { type: "boolean", description: "Override projectMemory.autoExtract for this run" });
+  pi.registerFlag("memory-disabled", { type: "boolean", default: false, description: "Disable memory for this process, overriding projectMemory.enabled" });
   let store: MemoryStore | undefined;
   let workspace = "";
   let auto = false;
@@ -40,15 +58,21 @@ export default function projectMemory(pi: ExtensionAPI) {
   let controller: AbortController | undefined;
   let run: { prompt: string; wrote: boolean; attempted: boolean } | undefined;
   let prepared: Awaited<ReturnType<typeof prepareExtraction>>;
-  const enabled = () => pi.getFlag("memory-disabled") !== true;
+  const enabled = () => readSettings(pi).enabled && pi.getFlag("memory-disabled") !== true;
+  const rootFor = (cwd: string) => {
+    const flag = pi.getFlag("memory-dir");
+    if (typeof flag === "string") return resolve(cwd, flag);
+    const directory = readSettings(pi).directory;
+    return directory ? expandDirectory(directory) : join(getAgentDir(), "project-memory");
+  };
   const checkpoint = () => pi.appendEntry("pi-project-memory.checkpoint", { at: new Date().toISOString() });
   const report = (value: unknown) => pi.sendMessage({ customType: "pi-project-memory.report", content: typeof value === "string" ? value : JSON.stringify(value, null, 2), display: true }, { triggerTurn: false });
 
   async function getStore(ctx: ExtensionContext) {
     if (!enabled()) throw new Error("Project memory is disabled for this process");
     if (!store || workspace !== ctx.cwd) {
-      const root = pi.getFlag("memory-dir");
-      store = new MemoryStore(typeof root === "string" ? resolve(ctx.cwd, root) : join(getAgentDir(), "project-memory"), await projectKey(ctx.cwd));
+      const root = rootFor(ctx.cwd);
+      store = new MemoryStore(root, await projectKey(ctx.cwd));
       workspace = ctx.cwd;
     }
     return store;
@@ -109,8 +133,7 @@ export default function projectMemory(pi: ExtensionAPI) {
 
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
     if (typeof path !== "string") return;
-    const configured = pi.getFlag("memory-dir");
-    const root = typeof configured === "string" ? resolve(ctx.cwd, configured) : join(getAgentDir(), "project-memory");
+    const root = rootFor(ctx.cwd);
     const target = resolve(ctx.cwd, path);
     const within = relative(root, target);
     if (within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) return;
@@ -132,7 +155,11 @@ export default function projectMemory(pi: ExtensionAPI) {
     catch { return { isError: true, content: [{ type: "text", text: "The Markdown edit is on disk but memory ingestion failed. Fix its flat frontmatter/content/size or resolve the store conflict. The edit was not silently rolled back." }] }; }
   });
 
-  pi.on("session_start", () => { epoch++; controller?.abort(); store = undefined; run = undefined; prepared = undefined; auto = pi.getFlag("memory-auto") === true; });
+  pi.on("session_start", () => {
+    epoch++; controller?.abort(); store = undefined; run = undefined; prepared = undefined;
+    const flag = pi.getFlag("memory-auto");
+    auto = typeof flag === "boolean" ? flag : readSettings(pi).autoExtract;
+  });
   pi.on("session_shutdown", () => { epoch++; controller?.abort(); run = undefined; prepared = undefined; store = undefined; });
   pi.on("before_agent_start", (event) => {
     epoch++;
@@ -244,7 +271,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         return;
       }
       const state = await memory.read();
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");
