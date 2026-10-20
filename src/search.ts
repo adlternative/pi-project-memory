@@ -1,14 +1,25 @@
 import type { Memory } from "./store.ts";
 
-export function tokenize(value: string): string[] {
+/** Conservative English suffix folding so install/installing/installation and dependency/dependencies meet. */
+export function stem(word: string): string {
+  if (!/^[a-z]+$/.test(word) || word.length <= 4) return word;
+  let w = word;
+  for (const [suffix, to] of [["ations", ""], ["ation", ""], ["ies", "y"], ["ing", ""], ["ed", ""], ["es", "e"], ["s", ""]] as const) {
+    if (w.endsWith(suffix) && w.length - suffix.length >= 3 && !(suffix === "s" && w.endsWith("ss"))) { w = w.slice(0, -suffix.length) + to; break; }
+  }
+  return w.replace(/e$/, "");
+}
+
+export function tokenize(value: string, query = false): string[] {
   const tokens: string[] = [];
   for (const match of value.normalize("NFKC").toLowerCase().matchAll(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]+|[\p{L}\p{N}_]+/gu)) {
     const word = match[0];
     if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(word)) {
       const chars = [...word];
-      tokens.push(...chars.map(char => "c:" + char));
+      // Documents keep unigrams; queries drop them (我, 的, 是… match everything) unless the run is one character.
+      if (!query || chars.length === 1) tokens.push(...chars.map(char => "c:" + char));
       for (let i = 0; i + 1 < chars.length; i++) tokens.push("b:" + chars[i] + chars[i + 1]);
-    } else tokens.push(word);
+    } else tokens.push(stem(word));
   }
   return tokens;
 }
@@ -17,7 +28,7 @@ export interface Hit { note: Memory; score: number }
 
 /** Small-corpus BM25: title weight 3, body weight 1; no network or persisted index. */
 export function search(notes: Memory[], query: string, limit = 5): Hit[] {
-  const terms = [...new Set(tokenize(query))];
+  const terms = [...new Set(tokenize(query, true))];
   if (!terms.length || !notes.length) return [];
   const documents = notes.map(note => [tokenize(note.title), tokenize((note.description ?? "") + " " + note.content)]);
   const averages = [0, 1].map(field => documents.reduce((sum, fields) => sum + fields[field].length, 0) / notes.length || 1);

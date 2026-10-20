@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rename, unlink, type FileHandle } from "node:fs/promises";
 import { join, parse, relative, sep } from "node:path";
+import { hostname } from "node:os";
+import { setTimeout as sleep } from "node:timers/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { hash, record, validId } from "./model.ts";
 import { INDEX_BYTES, TOPIC_BYTES } from "./markdown.ts";
@@ -13,6 +15,55 @@ const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "E
 const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const allowed = (name: string) => ["MEMORY.md", ".state.json", "memories.json", ".legacy-memories.json", ".pending.json"].includes(name) || (name.endsWith(".md") && validId(name.slice(0, -3)));
 const limit = (name: string) => name === ".pending.json" ? 4 * MIB : name === "MEMORY.md" ? INDEX_BYTES : name.endsWith(".md") ? TOPIC_BYTES : MIB;
+
+const LOCK_WAIT_MS = 3000;
+
+/** A lock whose owner is a dead process on this host. Unknown/foreign/unparseable locks are never reclaimed. */
+function deadOwner(text: string): boolean {
+  try {
+    const owner = record(JSON.parse(text));
+    if (owner.host !== hostname() || !Number.isSafeInteger(owner.pid) || (owner.pid as number) <= 0) return false;
+    try { process.kill(owner.pid as number, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  } catch { return false; }
+}
+
+/** Serialize reclaimers so one cannot delete a fresh lock another reclaimer just acquired. */
+async function reclaim(lockPath: string, dead: string): Promise<boolean> {
+  const guard = lockPath + ".reclaim";
+  let handle: FileHandle;
+  try { handle = await open(guard, "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // A reclaim takes milliseconds; a guard older than 10s was left by a crash mid-reclaim.
+    const info = await lstat(guard).catch(() => null);
+    if (info && Date.now() - info.mtimeMs > 10_000) await unlink(guard).catch(() => {});
+    return false;
+  }
+  try {
+    // Nonces are unique, so a fresh lock never equals the dead text.
+    if (await readFile(lockPath, "utf8").catch(() => null) !== dead) return false;
+    await unlink(lockPath).catch(() => {});
+    return true;
+  } finally { await handle.close(); await unlink(guard).catch(() => {}); }
+}
+
+/** Short bounded retry for live contention; reclaim only provably dead same-host owners; otherwise fail closed. */
+async function acquire(lockPath: string, signal?: AbortSignal): Promise<FileHandle> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (let delay = 10; ; delay = Math.min(delay * 2, 200)) {
+    signal?.throwIfAborted();
+    try {
+      const lock = await open(lockPath, "wx", 0o600);
+      try { await lock.writeFile(JSON.stringify({ pid: process.pid, host: hostname(), nonce: randomUUID(), startedAt: new Date().toISOString() })); }
+      catch (error) { await lock.close(); await unlink(lockPath).catch(() => {}); throw error; }
+      return lock;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const text = await readFile(lockPath, "utf8").catch(() => null);
+    if (text !== null && deadOwner(text) && await reclaim(lockPath, text)) continue;
+    if (Date.now() >= deadline) throw new Error("Memory store busy: retry; a .lock not owned by a dead local Pi process is never removed automatically");
+    await sleep(delay + Math.floor(Math.random() * delay), undefined, { signal });
+  }
+}
 
 /** Private memory-file I/O: no arbitrary paths, links, silent corruption or partial multi-file reads. */
 export class MemoryFiles {
@@ -61,14 +112,9 @@ export class MemoryFiles {
     return withFileMutationQueue(join(this.dir, ".state.json"), async () => {
       signal?.throwIfAborted();
       await this.directory(true);
-      // shortcut: crash-left locks fail closed; inspect/remove .lock only after closing other Pi sessions.
       const lockPath = join(this.dir, ".lock");
-      const lock = await open(lockPath, "wx", 0o600).catch(error => {
-        if (error.code === "EEXIST") throw new Error("Memory store busy: retry; inspect a crash-left .lock after closing other Pi sessions");
-        throw error;
-      });
+      const lock = await acquire(lockPath, signal);
       try {
-        await lock.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
         await this.recover();
         signal?.throwIfAborted();
         return await fn();

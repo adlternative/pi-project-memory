@@ -4,7 +4,7 @@ import { lstat, realpath, rename } from "node:fs/promises";
 import { promisify } from "node:util";
 import { MemoryFiles, type Change, type FileText } from "./files.ts";
 import { parseTopic, renderIndex, renderTopic } from "./markdown.ts";
-import { clip, fingerprint, hash, legacyState, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
+import { clip, fingerprint, hash, legacyState, MAX_FORGOTTEN, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
 export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInput } from "./model.ts";
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
 
@@ -95,7 +95,7 @@ export class MemoryStore {
       if (body === undefined || body === null) throw new Error("Missing Markdown for memory metadata");
       return [note.id, noteMetadata(note, hash(body))];
     }));
-    const disk = validateDisk({ version: 2, revision: loaded.disk.revision + 1, records, forgotten, indexHash: hash(index) });
+    const disk = validateDisk({ version: 2, revision: loaded.disk.revision + 1, records, forgotten: forgotten.slice(-MAX_FORGOTTEN), indexHash: hash(index) });
     const changes: Change[] = [...edits].map(([name, after]) => ({ name, before: loaded.documents.get(name)?.hash ?? null, after }));
     changes.push(...extras);
     if (index !== loaded.index?.text) changes.push({ name: "MEMORY.md", before: loaded.index?.hash ?? null, after: index });
@@ -103,7 +103,8 @@ export class MemoryStore {
     await this.files.commit(changes, signal);
   }
 
-  private async load(): Promise<Loaded> {
+  /** tolerant: skip unreadable topic files (reported in state.invalid) and never reconcile/persist while any exist. */
+  private async load(tolerant = false): Promise<Loaded> {
     const metadata = await this.files.read(".state.json");
     const legacy = await this.files.read("memories.json");
     const index = await this.files.read("MEMORY.md");
@@ -114,21 +115,30 @@ export class MemoryStore {
     const documents = new Map<string, FileText>();
     const notes: Memory[] = [];
     let forgotten = [...disk.forgotten];
+    const invalid: { file: string; error: string }[] = [];
     for (const name of names) {
-      const file = await this.files.read(name);
-      if (!file) throw new Error(`Memory file changed during read: ${name}`);
+      let file: FileText | null, input;
+      try {
+        file = await this.files.read(name);
+        if (!file) throw new Error(`Memory file changed during read: ${name}`);
+        input = parseTopic(name, file.text);
+      } catch (error) {
+        if (!tolerant || legacy) throw error;
+        invalid.push({ file: name, error: (error as Error).message });
+        continue;
+      }
       documents.set(name, file);
-      const input = parseTopic(name, file.text);
       const prior = Object.hasOwn(disk.records, input.id) ? disk.records[input.id] : undefined;
       const unchanged = prior?.hash === file.hash;
       const source: Source = unchanged ? prior.source : { sessionId: "filesystem", entryId: name, quote: clip(input.content, 400), origin: "file" };
       notes.push({ ...input, source, createdAt: prior?.createdAt ?? file.modifiedAt, updatedAt: unchanged ? prior.updatedAt : file.modifiedAt });
       if (!unchanged) forgotten = forgotten.filter(id => id !== input.id && id !== fingerprint(input.content));
     }
-    for (const [id, prior] of Object.entries(disk.records)) if (!documents.has(`${id}.md`)) forgotten.push(id, prior.contentHash);
-    forgotten = [...new Set(forgotten)];
-    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: renderIndex(index?.text ?? null, notes) };
+    for (const [id, prior] of Object.entries(disk.records)) if (!documents.has(`${id}.md`) && !invalid.some(item => item.file === `${id}.md`)) forgotten.push(id, prior.contentHash);
+    forgotten = [...new Set(forgotten)].slice(-MAX_FORGOTTEN);
+    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: renderIndex(index?.text ?? null, notes), ...(invalid.length ? { invalid } : {}) };
     const loaded: Loaded = { state, disk, metadata, index, documents };
+    if (invalid.length) return loaded;
     if (legacy) {
       if (names.length || index) throw new Error("Legacy JSON and existing Markdown coexist; migration refuses to overwrite authored files");
       const old = legacyState(JSON.parse(legacy.text));
@@ -158,10 +168,11 @@ export class MemoryStore {
     await rename(this.legacyDir, this.dir).catch(error => { if (error.code !== "ENOENT" && error.code !== "EEXIST") throw error; });
   }
 
-  async read(): Promise<State> {
+  /** Strict by default. tolerant skips broken topic files (listed in state.invalid) for read-only callers. */
+  async read(options: { tolerant?: boolean } = {}): Promise<State> {
     await this.adoptLegacyDir();
     if (!await this.files.directory(false)) return emptyState();
-    return this.files.locked(async () => (await this.load()).state);
+    return this.files.locked(async () => (await this.load(options.tolerant)).state);
   }
 
   async save(drafts: Draft[], options: { automatic?: boolean; expectedRevision?: number; signal?: AbortSignal } = {}): Promise<Memory[]> {
@@ -178,7 +189,11 @@ export class MemoryStore {
       for (const input of validated) {
         const digest = fingerprint(input.content);
         if (options.automatic && (forgotten.includes(input.id) || forgotten.includes(digest))) continue;
-        const existing = notes.find(note => note.id === input.id) ?? notes.find(note => fingerprint(note.content) === digest);
+        const sameId = notes.find(note => note.id === input.id);
+        // Identical content under another id is a duplicate: return that note untouched instead of renaming it.
+        const duplicate = sameId ? undefined : notes.find(note => fingerprint(note.content) === digest);
+        if (duplicate) { saved.push(duplicate); continue; }
+        const existing = sameId;
         const description = input.description ?? existing?.description;
         if (existing && existing.content === input.content && existing.title === input.title && existing.type === input.type && existing.description === description) { saved.push(existing); continue; }
         if (!options.automatic) forgotten = forgotten.filter(id => id !== input.id && id !== digest);

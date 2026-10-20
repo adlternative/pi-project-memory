@@ -5,9 +5,11 @@ export type MemoryType = (typeof TYPES)[number];
 export interface MemoryInput { id: string; type: MemoryType; title: string; description?: string; content: string }
 export interface Source { sessionId: string; entryId: string; quote: string; origin: "explicit" | "extracted" | "file" }
 export interface Memory extends MemoryInput { source: Source; createdAt: string; updatedAt: string }
-export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string }
+export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; invalid?: { file: string; error: string }[] }
 export interface Draft extends MemoryInput { source: Source }
 export const MAX_NOTES = 128;
+/** Tombstones roll over oldest-first; forgetting must never brick the store. */
+export const MAX_FORGOTTEN = 512;
 export const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 export const fingerprint = (text: string) => "sha:" + hash(text.normalize("NFKC").toLowerCase().replace(/\s+/gu, " ").trim());
 export const validId = (id: string) => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id) && id !== "memory";
@@ -26,7 +28,8 @@ export function redact(text: string): string {
     .replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b/g, "[REDACTED]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [REDACTED]")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED]")
-    .replace(/(\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|token)\b["']?\s*[:=]\s*)["']?[^\s,"';&}]+["']?/gi, "$1[REDACTED]")
+    // Keyword rule only fires on secret-shaped values (ASCII and either 8+ chars with a digit/symbol, or 20+ chars), so prose like "password: ask ops" survives.
+    .replace(/(\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|token)\b["']?\s*[:=]\s*)["']?(?=[\w.\/+=~!@#$%^*-]*[\d.\/+=~!@#$%^*_-]|[\w.\/+=~!@#$%^*-]{20})[\w.\/+=~!@#$%^*-]{8,}["']?/gi, "$1[REDACTED]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@")
     .replace(/([?&](?:token|key|api_key|password|signature|x-amz-signature|x-amz-security-token)=)[^\s&#]+/gi, "$1[REDACTED]");
 }
@@ -69,7 +72,7 @@ export function timestamp(value: unknown): string {
 
 export function validateForgotten(value: unknown): string[] {
   if (!Array.isArray(value)) throw new Error("Invalid forgotten memory list");
-  if (value.length > 1024) throw new Error("Forgotten marker limit reached; archive/review the store before adding more");
+  if (value.length > 1024) throw new Error("Invalid forgotten memory list: too many markers");
   return value.map(id => {
     if (typeof id !== "string" || (!validId(id) && !/^sha:[a-f0-9]{64}$/.test(id))) throw new Error("Invalid forgotten id");
     return id;

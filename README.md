@@ -98,7 +98,7 @@ Review what was saved:
 | `pmem_list({offset?})` | Ten previews per page with relative `.md` paths and `nextOffset` |
 | `pmem_read({id})` | One complete note with its path and provenance |
 | `pmem_search({query, mode?})` | Local `keyword` BM25 by default; optional `semantic` model selection; up to five matches |
-| `pmem_save({id,type,title,description?,content})` | Create or update one topic file |
+| `pmem_save({id,type,title,description?,content})` | Create or update one topic file. Identical content under a different id returns the existing note unchanged |
 
 Structured tool output is `{directory,indexPath,notes,truncated,nextOffset}`; each `note.path` is relative to `directory`.
 
@@ -149,6 +149,7 @@ Use pnpm rather than npm by default.
 - Filenames are lowercase letters, digits, `-`, or `_`, up to 64 characters. `memory` is reserved for the index.
 - Flat plain, JSON double-quoted, and YAML single-quoted values are supported. Folded values, nested YAML, and aliases are not.
 - Delete a topic file to forget it. Recreating it later is an explicit manual restore.
+- A topic file that fails to parse is skipped by recall, `pmem_list/read/search`, and `/pmem` (which list it under `invalid`); saves stay blocked until you fix it.
 - Do not edit `.state.json`, `.pending.json`, or `.lock`. They are internal.
 
 `MEMORY.md` is regenerated only inside its markers, so custom notes above or below survive:
@@ -207,7 +208,7 @@ Recall runs on every request:
 - This is request-local. It does not append to, or rewrite, your stored conversation.
 - Only fixed `project_memory` usage rules are added to the prompt. Your system prompt and `SYSTEM.md` are not replaced.
 
-Search is local BM25 with title weight 3 and description/body weight 1, tokenizing English words and CJK characters/bigrams. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
+Search is local BM25 with title weight 3 and description/body weight 1. English words are folded by common suffixes (`installation` → `install`, `dependencies` → `dependency`). CJK text is indexed as characters and bigrams, but queries use only bigrams (a lone character still matches) so common characters such as 的/我 do not pull in unrelated notes. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
 
 Automatic extraction is off unless `projectMemory.autoExtract` (or `--memory-auto`) enables it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each). System prompts, thinking, tool output, and abandoned branches are excluded. Failed, aborted, or stale candidates are discarded.
 
@@ -227,11 +228,11 @@ There is no background "dreaming": no scheduled full-store consolidation, automa
 
 ## Safety and scope
 
-- **Not secure erasure.** `/pmem forget` deletes the topic and blocks automatic restoration of that id or identical content. It does not erase your original Pi sessions, migration backups, or historical provenance quotes stored in other notes. Treat deleted facts as recoverable from history.
+- **Not secure erasure.** `/pmem forget` deletes the topic and blocks automatic restoration of that id or identical content. The newest 512 tombstone markers are kept; older ones roll off, so a very old forgotten fact could be re-extracted. It does not erase your original Pi sessions, migration backups, or historical provenance quotes stored in other notes. Treat deleted facts as recoverable from history.
 - **Memory is untrusted input.** Notes are injected as data, not instructions, and the agent is told current instructions win. Memory is not a prompt-injection boundary: anything written to a note can influence later sessions. Leave automatic extraction off for sensitive conversations.
-- Known credential formats are redacted before extraction, and obvious credentials are rejected when saving. This is not DLP and cannot catch every secret.
+- Known credential formats are redacted before extraction, and obvious credentials are rejected when saving. `password:`/`token=`-style keywords only trigger on secret-shaped values (8+ ASCII chars with a digit or symbol, or 20+ chars), so prose like "password: ask ops" can be saved. This is not DLP and cannot catch every secret.
 - Writes use an in-process queue plus a cross-process lock, replace each file atomically, and journal multi-file updates with `.state.json` committed last. Uncooperative external editors do not take the lock, so conflicts stop recovery with the journal intact rather than overwriting your newer text.
-- A crash-left `.lock` deliberately blocks access. Close Pi sessions using that store, then inspect and remove only the stale lock. Never delete `.pending.json` or `.state.json` to "fix" a store.
+- Writers wait up to 3 seconds for a busy lock. A `.lock` whose owner is a dead process on the same host is reclaimed automatically; any other lock (live, other host, unreadable) still blocks, so close the other Pi sessions before removing it by hand. Never delete `.pending.json` or `.state.json` to "fix" a store.
 - Path traversal, symlinks, hardlinked data files, invalid UTF-8, and unknown state are rejected. New files are `0600` and directories `0700` (Windows uses platform semantics).
 
 ## Update and uninstall
@@ -250,7 +251,7 @@ Add `-l` to update or remove the project-scoped entry. Removing the package does
 
 **Nothing is recalled.** `/pmem` must show a directory that exists. Memory is per-repository, so a different checkout has its own store. Notes are only recalled when they match; check `/pmem list`.
 
-**Writes stop with a busy or conflict error.** Another Pi process holds the lock, or an external edit conflicted with a pending transaction. Close the other sessions, inspect `.pending.json` and the affected topic, and keep the newer manual edit.
+**Writes stop with a busy or conflict error.** Another live Pi process held the lock for more than 3 seconds, or an external edit conflicted with a pending transaction. Close the other sessions, inspect `.pending.json` and the affected topic, and keep the newer manual edit.
 
 **`/pmem forget` didn't remove everything.** It removes the note from memory. Historical sessions, backups, and provenance quotes in other notes keep it; see [Safety and scope](#safety-and-scope).
 
