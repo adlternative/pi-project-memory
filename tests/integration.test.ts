@@ -30,6 +30,17 @@ test("real file extension loads only four tools; explicit model tool saves and s
   assert.ok(h.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "pi-project-memory.checkpoint"));
 });
 
+test("an empty store injects nothing, so the model is never told the index is empty", async t => {
+  const empty = await makeHarness(t);
+  await empty.session.prompt("Hello.");
+  assert.equal(JSON.stringify(empty.requests[0].context).includes("pi-memory:index"), false);
+  assert.equal(empty.manager.getEntries().some(entry => entry.type === "custom_message" && entry.customType === "pi-project-memory.index"), false);
+  await empty.store.save([{ ...noteArgs, type: "project", source: { sessionId: "s", entryId: "e", quote: "q", origin: "explicit" } }]);
+  const next = await makeHarness(t, { root: empty.root });
+  await next.session.prompt("What do you know?");
+  assert.ok(JSON.stringify(next.requests[0].context).includes("package-manager"));
+});
+
 test("a fresh Pi session loads the index once and leaves topic bodies on disk", async t => {
   const h = await makeHarness(t);
   await h.store.save([{ ...noteArgs, type: "feedback", source: { sessionId: "old-session", entryId: "old-user", quote: "Use pnpm", origin: "explicit" } }]);

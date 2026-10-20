@@ -179,6 +179,8 @@ export default function projectMemory(pi: ExtensionAPI) {
     if (event.messageType !== "user" || recalled(ctx)) return;
     const memory = await getStore(ctx);
     const state = await memory.read({ tolerant: true }).catch(() => undefined);
+    // Nothing saved and nothing broken: load nothing, instead of announcing an empty index every session.
+    if (state && !state.notes.length && !state.invalid) return;
     const data = state
       ? { notice: NOTICE, directory: memory.dir, indexPath: "MEMORY.md", ...(state.invalid ? { invalid: state.invalid.slice(0, 4).map(item => ({ file: item.file, error: clip(item.error, 160) })), repair: "These topic files were skipped; saves are blocked until they are fixed with read/edit." } : {}), index: clip(state.index.split("\n").slice(0, 200).join("\n"), 3000) }
       : { notice: "Saved memory is temporarily unavailable: repair invalid topic Markdown or resolve the store conflict. It was not treated as an empty store. Do not edit hidden state files.", directory: memory.dir, indexPath: "MEMORY.md" };
