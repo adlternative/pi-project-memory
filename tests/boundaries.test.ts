@@ -41,8 +41,8 @@ test("JSON escaping and long provenance cannot make request-local memory break a
   await h.session.prompt("Explain alpha.");
   assert.equal(h.session.getLastAssistantText(), "Done.");
   assert.deepEqual(h.errors, []);
-  const injected = h.requests[0].context.messages.find(message => message.role === "user" && JSON.stringify(message.content).includes("Untrusted saved project notes"));
-  assert.ok(injected && injected.role === "user");
+  const injected = h.requests[0].context.messages.find(message => JSON.stringify(message.content).includes("Untrusted saved project notes"));
+  assert.ok(injected);
   const text = typeof injected.content === "string" ? injected.content : injected.content.filter(part => part.type === "text").map(part => part.text).join("\n");
   assert.ok(Buffer.byteLength(text) <= 6000);
 });

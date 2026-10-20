@@ -30,17 +30,17 @@ test("real file extension loads only four tools; explicit model tool saves and s
   assert.ok(h.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "pi-project-memory.checkpoint"));
 });
 
-test("a fresh Pi session recalls saved notes without persisting injected messages or mutating old history", async t => {
+test("a fresh Pi session loads the index once and leaves topic bodies on disk", async t => {
   const h = await makeHarness(t);
   await h.store.save([{ ...noteArgs, type: "feedback", source: { sessionId: "old-session", entryId: "old-user", quote: "Use pnpm", origin: "explicit" } }]);
   const fresh = await makeHarness(t, { root: h.root });
   await fresh.session.prompt("How should I install dependencies for this project?");
   const input = JSON.stringify(fresh.requests[0].context);
-  assert.ok(input.includes("package-manager"));
-  assert.ok(input.includes("Use pnpm, not npm"));
+  assert.ok(input.includes("package-manager"), "the index links the topic");
   assert.ok(input.includes("Untrusted saved project notes"));
+  assert.equal(input.includes("Use pnpm, not npm"), false, "topic bodies are not injected; they stay on disk");
   const before = fresh.manager.getEntries();
-  assert.equal(before.some(entry => entry.type === "custom_message" && entry.customType === "pi-project-memory.recall"), false);
+  assert.equal(before.filter(entry => entry.type === "custom_message" && entry.customType === "pi-project-memory.index").length, 1);
   await fresh.session.prompt("Another dependency installation question.");
   assert.deepEqual(fresh.manager.getEntries().slice(0, before.length), before);
   assert.equal(JSON.stringify(fresh.requests[1].context).match(/Untrusted saved project notes/g)?.length, 1);

@@ -232,7 +232,9 @@ test("real Pi writes can create and repair a topic; a fresh session reads it wit
   assert.equal(results[0].isError, true); assert.equal(results[1].isError, false, JSON.stringify(results[1].content));
   const cold = await makeHarness(t, { root: h.root });
   await cold.session.prompt("How should I write design notes?");
-  assert.ok(JSON.stringify(cold.requests[0].context).includes("Keep design notes short."));
+  const parked = JSON.stringify(cold.requests[0].context);
+  assert.ok(parked.includes("feedback_style.md"));
+  assert.equal(parked.includes("Keep design notes short."), false);
   assert.ok((await cold.store.read()).index.includes("(feedback_style.md)"));
   assert.deepEqual(h.errors, []);
 });

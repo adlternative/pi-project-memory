@@ -8,7 +8,7 @@ Because memory is plain Markdown, you own it: open the folder in your editor, de
 - Optional model-assisted semantic search for paraphrases and cross-language queries
 - Optional, opt-in automatic extraction of durable facts at the end of a successful turn
 - Per-repository scope: worktrees and subdirectories of one repo share memory; unrelated projects stay isolated
-- Bounded recall (6 KB per request) instead of replaying everything ever saved
+- Bounded recall: the index loads once per session, topic bodies stay on disk until read
 
 > This repository is private. `pi install` needs Git access to it — see [Install](#install).
 
@@ -82,7 +82,7 @@ The agent saves each fact as its own topic file. In a later session, without rep
 How should I install dependencies here, and where do reviews go?
 ```
 
-Recall happens automatically: before each model request the extension injects the bounded index plus the most relevant notes, marked as untrusted historical data. The agent can also search and read memory explicitly with the tools below.
+Recall happens automatically: at the start of a session the extension injects the bounded `MEMORY.md` index as untrusted historical data, then leaves topic bodies on disk. The agent reads a note with `pmem_read` or the file tools when it matters, and can search explicitly with the tools below. This mirrors Claude Code auto memory: the index loads once, topic files load on demand.
 
 Review what was saved:
 
@@ -202,10 +202,10 @@ Precedence is flag, then settings, then default. A flag affects only the process
 
 ## Retrieval, extraction, and limits
 
-Recall runs on every request:
+Recall loads once per session:
 
-- The first 200 lines / 3,000 UTF-8 bytes of `MEMORY.md`, plus up to three BM25 snippets of 600 bytes each, within a 6,000-byte total.
-- This is request-local. It does not append to, or rewrite, your stored conversation.
+- The first 200 lines / 3,000 UTF-8 bytes of `MEMORY.md`, as one non-displayed conversation message, within a 6,000-byte total. Topic bodies are never injected.
+- The message is written to the conversation once per session, so it survives a resume but never repeats. A compaction that drops it makes the next run inject the index again.
 - Only fixed `project_memory` usage rules are added to the prompt. Your system prompt and `SYSTEM.md` are not replaced.
 
 Search is local BM25 with title weight 3 and description/body weight 1. English words are folded by common suffixes (`installation` → `install`, `dependencies` → `dependency`). CJK text is indexed as characters and bigrams, but queries use only bigrams (a lone character still matches) so common characters such as 的/我 do not pull in unrelated notes. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.

@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getCurrentTools } from "@earendil-works/pi-ai";
@@ -16,7 +16,7 @@ export default function (pi: ExtensionAPI) {
       if (trace) appendFileSync(trace, JSON.stringify({ kind: request.kind, recalled, tools: getCurrentTools(request.context.messages).map(tool => tool.name) }) + "\n");
       if (request.kind === "extract") return extraction(request);
       step++;
-      let memory: { directory: string; matches?: { content: string }[] } | undefined;
+      let memory: { directory: string; index?: string } | undefined;
       for (const message of request.context.messages) {
         if (message.role !== "user") continue;
         const text = typeof message.content === "string" ? message.content : message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
@@ -27,7 +27,9 @@ export default function (pi: ExtensionAPI) {
         if (step === 1) return tool("read", { path });
         if (step === 2) return tool("edit", { path, edits: [{ oldText: "Use pnpm, not npm", newText: "Use bun, not npm" }] });
       }
-      return recalled ? (memory?.matches?.some(note => note.content.includes("Use bun")) ? "Use bun [pmem:package-manager]." : "Use pnpm [pmem:package-manager].") : "No saved project notes yet.";
+      let topic = "";
+      try { topic = memory ? readFileSync(join(memory.directory, "package-manager.md"), "utf8") : ""; } catch { /* Nothing saved yet. */ }
+      return recalled ? (topic.includes("Use bun") ? "Use bun [pmem:package-manager]." : "Use pnpm [pmem:package-manager].") : "No saved project notes yet.";
     }, []),
   });
 }
