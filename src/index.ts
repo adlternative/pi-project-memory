@@ -145,7 +145,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         await memory.read({ tolerant: true }).catch(() => undefined);
         if (signal.aborted) return;
         const ids = result.written.map(name => name.replace(/\.md$/, ""));
-        pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: ids, turns: result.turns, ...(requested ? { requestedModel: requested } : {}) });
+        pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: ids, turns: result.turns, provider: model.provider, model: model.id, ...(requested ? { requestedModel: requested } : {}) });
         checkpoint();
         if (ctx.hasUI && ids.length) ctx.ui.notify(`Project memory: saved ${ids.length} note(s)`, "info");
       } catch (error) {
