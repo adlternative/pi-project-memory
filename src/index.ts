@@ -7,6 +7,7 @@ import { clip, MemoryStore, projectIdentity, TYPES, type Memory } from "./store.
 import { search } from "./search.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
+import { runForkExtraction } from "./fork-extraction.ts";
 
 const MemorySchema = Type.Object({
   id: Type.String(), type: Type.Union(TYPES.map(type => Type.Literal(type))),
@@ -38,7 +39,7 @@ function result(memory: MemoryStore, notes: Memory[], truncated = false, nextOff
 
 export interface MemorySettings {
   enabled: boolean; directory?: string; autoExtract: boolean; extractModel: string; dedicatedTools: boolean;
-  everyNTurns: number; idleFlushSeconds: number;
+  everyNTurns: number; idleFlushSeconds: number; extractionMode: "call" | "fork";
 }
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
 
@@ -55,6 +56,7 @@ function readSettings(pi: ExtensionAPI): MemorySettings {
     dedicatedTools: value.dedicatedTools === true,
     everyNTurns: Math.round(number(value.everyNTurns, 5, 1, 100)),
     idleFlushSeconds: number(value.idleFlushSeconds, 120, 0, 86_400),
+    extractionMode: value.extractionMode === "fork" ? "fork" : "call",
   };
 }
 
@@ -131,6 +133,28 @@ export default function projectMemory(pi: ExtensionAPI) {
     }
     if (!evidence.some(entry => entry.role === "user")) return;
     const { model, requested } = extractionModel(ctx);
+    const mode = readSettings(pi).extractionMode;
+    if (mode === "fork") {
+      // Claude Code style: a bounded sub-agent that reads and writes the notes itself.
+      try {
+        if (!model) throw new Error("No model available for memory extraction");
+        const result = await runForkExtraction({
+          model, modelRegistry: ctx.modelRegistry, memoryDir: memory.dir,
+          evidence: input, index: snapshot.index, signal,
+        });
+        await memory.read({ tolerant: true }).catch(() => undefined);
+        if (signal.aborted) return;
+        const ids = result.written.map(name => name.replace(/\.md$/, ""));
+        pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: ids, turns: result.turns, ...(requested ? { requestedModel: requested } : {}) });
+        checkpoint();
+        if (ctx.hasUI && ids.length) ctx.ui.notify(`Project memory: saved ${ids.length} note(s)`, "info");
+      } catch (error) {
+        if (signal.aborted) return;
+        pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, trigger, reason: clip(error instanceof Error ? error.message : String(error), 300), ...(requested ? { requestedModel: requested } : {}) });
+        if (ctx.hasUI) ctx.ui.notify("Project memory extraction failed; no notes changed.", "warning");
+      }
+      return;
+    }
     let response;
     try {
       const answer = await modelJSON(ctx, model, EXTRACTION_PROMPT, input, signal);
@@ -144,12 +168,12 @@ export default function projectMemory(pi: ExtensionAPI) {
       }
       const saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal });
       // Lifecycle callbacks cannot append a public UsageEntry; expose separate bookkeeping instead.
-      pi.appendEntry("pi-project-memory.extraction", { status: "ok", trigger, saved: saved.map(note => note.id), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
       checkpoint();
       if (ctx.hasUI && saved.length) ctx.ui.notify(`Project memory: saved ${saved.length} note(s)`, "info");
     } catch {
       if (signal.aborted) return;
-      pi.appendEntry("pi-project-memory.extraction", { status: "failed", ...(response ? { provider: response.provider, model: response.model, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
+      pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, ...(response ? { provider: response.provider, model: response.model, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
       if (ctx.hasUI) ctx.ui.notify("Project memory extraction failed; no notes changed. Retry /pmem extract after checking the provider/store.", "warning");
     }
   }
@@ -333,7 +357,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         return;
       }
       const state = await memory.read({ tolerant: true });
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, extractModel: readSettings(pi).extractModel, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");

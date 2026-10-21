@@ -187,6 +187,7 @@ Configure memory in Pi settings, so it applies to every session after installati
 | `autoExtract` | `false` | Opt in to one bounded extraction call after a successful persistent turn |
 | `extractModel` | `qoder/fast` | Model used for extraction, as `provider/model` or a bare id. Falls back to the session model when unavailable, recording `requestedModel` |
 | `everyNTurns` | `5` | Run one extraction pass every N user prompts, counting only prompts that ended normally |
+| `extractionMode` | `"call"` | `"call"` sends one no-tool JSON request. `"fork"` runs a bounded sub-agent (up to 6 turns) with two memory-only tools, so it can read existing notes and rewrite them itself |
 | `idleFlushSeconds` | `120` | Also run a pass after this much idle time when the cadence has not been reached; `0` disables it |
 | `dedicatedTools` | `false` | Expose `pmem_list`/`pmem_read`/`pmem_search`/`pmem_save`. Off by default: like Claude Code and Codex, the memory directory is the interface and ordinary `read`/`edit`/`write` do the work |
 
@@ -217,6 +218,8 @@ Recall loads once per session:
 Search is local BM25 with title weight 3 and description/body weight 1. English words are folded by common suffixes (`installation` → `install`, `dependencies` → `dependency`). CJK text is indexed as characters and bigrams, but queries use only bigrams (a lone character still matches), so very common characters do not pull in unrelated notes. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
 
 Automatic extraction is off unless `projectMemory.autoExtract` (or `--memory-auto`) enables it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each), using `projectMemory.extractModel` (`qoder/fast` by default). System prompts, thinking, tool output, and abandoned branches are excluded. Failed or stale candidates are discarded.
+
+In `fork` mode the sub-agent gets only `read_memory` and `write_memory`, both confined to the current project's memory directory; it cannot touch `MEMORY.md`, hidden state, other projects, or the wider filesystem, and it runs the same cadence, coalescing and staleness rules.
 
 The call runs **detached**, like Claude Code: the turn settles immediately and memory is written afterwards. Cadence follows Claude Code too: one pass every `everyNTurns` prompts, or after `idleFlushSeconds` of inactivity when that cadence has not been reached. Only one pass runs at a time; a request arriving while one is in flight is queued as a single trailing pass. A pass is abandoned when a newer turn has already started, results are re-checked against the store revision before writing, and a shutdown first runs a pending idle pass, then drains in-flight work for up to 15 seconds. Progress is recorded in `pi-project-memory.extraction` entries with a `trigger` of `cadence`, `idle`, `trailing`, or `manual`. `/pmem extract` runs the same pass synchronously.
 
