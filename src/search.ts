@@ -16,7 +16,7 @@ export function tokenize(value: string, query = false): string[] {
     const word = match[0];
     if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(word)) {
       const chars = [...word];
-      // Documents keep unigrams; queries drop them (我, 的, 是… match everything) unless the run is one character.
+      // Documents keep unigrams; queries drop them (common particles match almost everything) unless the run is one character.
       if (!query || chars.length === 1) tokens.push(...chars.map(char => "c:" + char));
       for (let i = 0; i + 1 < chars.length; i++) tokens.push("b:" + chars[i] + chars[i + 1]);
     } else tokens.push(stem(word));
