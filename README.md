@@ -219,7 +219,7 @@ Search is local BM25 with title weight 3 and description/body weight 1. English 
 
 Automatic extraction is off unless `projectMemory.autoExtract` (or `--memory-auto`) enables it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each), using `projectMemory.extractModel` (`qoder/fast` by default). System prompts, thinking, tool output, and abandoned branches are excluded. Failed or stale candidates are discarded.
 
-In `fork` mode the sub-agent gets only `read_memory` and `write_memory`, both confined to the current project's memory directory; it cannot touch `MEMORY.md`, hidden state, other projects, or the wider filesystem, and it runs the same cadence, coalescing and staleness rules.
+In `fork` mode the sub-agent gets only `read_memory` and `write_memory`, both confined to the current project's memory directory; it cannot touch `MEMORY.md`, hidden state, other projects, or the wider filesystem, and it runs the same cadence, coalescing and staleness rules. Its writes are **staged, not applied during the loop**: a cancelled or failed pass discards them entirely, and an accepted pass writes each file atomically at the end (one rename per file).
 
 The call runs **detached**, like Claude Code: the turn settles immediately and memory is written afterwards. Cadence follows Claude Code too: one pass every `everyNTurns` prompts, or after `idleFlushSeconds` of inactivity when that cadence has not been reached. Only one pass runs at a time; a request arriving while one is in flight is queued as a single trailing pass. A pass is abandoned when a newer turn has already started, results are re-checked against the store revision before writing, and a shutdown first runs a pending idle pass, then drains in-flight work for up to 15 seconds. Progress is recorded in `pi-project-memory.extraction` entries with a `trigger` of `cadence`, `idle`, `trailing`, or `manual`. `/pmem extract` runs the same pass synchronously.
 
@@ -298,7 +298,7 @@ A real-model journey over a disposable Node project is documented in [`e2e/live/
 ### Known limitations
 
 - Developed and tested on macOS with Pi 1.2.0. Linux and Windows are untested.
-- Power-loss durability is not verified.
+- Power-loss durability is not verified. Fork mode commits its staged files at the end, so a crash during that short commit can still leave a subset written.
 - One model and one small project were used for the live journey; it is not a broad reliability benchmark.
 - Forget is not privacy-grade erasure (above).
 - Renaming or moving a repository starts a new store at the new path; migrate the old directory manually (see [Where memory lives](#where-memory-lives)).

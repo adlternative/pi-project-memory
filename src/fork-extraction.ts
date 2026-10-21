@@ -23,7 +23,7 @@ function scopedPath(memoryDir: string, path: string): string {
 }
 
 /** Memory-root-scoped tools: the sub-agent never sees shell, edit, or the wider filesystem. */
-export function memoryTools(memoryDir: string, written: Set<string>): ScopedTool[] {
+export function memoryTools(memoryDir: string, staged: Map<string, string>): ScopedTool[] {
   return [
     {
       name: "read_memory",
@@ -31,6 +31,9 @@ export function memoryTools(memoryDir: string, written: Set<string>): ScopedTool
       description: "Read a Markdown file from the project memory directory. Paths are relative to it.",
       parameters: Type.Object({ path: Type.String({ description: "Relative path, e.g. MEMORY.md or package-manager.md" }) }),
       async execute(_id, params) {
+        // Read-your-writes: the staged copy wins so the sub-agent sees its own edits.
+        const pending = staged.get(params.path);
+        if (pending !== undefined) return { content: [{ type: "text" as const, text: clip(pending, 20_000) }], details: undefined };
         const { readFile } = await import("node:fs/promises");
         const text = await readFile(scopedPath(memoryDir, params.path), "utf8").catch(() => null);
         return { content: [{ type: "text" as const, text: text === null ? `No file at ${params.path}` : clip(text, 20_000) }], details: undefined };
@@ -48,11 +51,8 @@ export function memoryTools(memoryDir: string, written: Set<string>): ScopedTool
         const target = scopedPath(memoryDir, params.path);
         if (relative(memoryDir, target) === "MEMORY.md") throw new Error("MEMORY.md is maintained automatically; write topic files instead");
         parseTopic(params.path, params.content);
-        const { mkdir, writeFile } = await import("node:fs/promises");
-        await mkdir(memoryDir, { recursive: true, mode: 0o700 });
-        await writeFile(target, params.content, { mode: 0o600 });
-        written.add(params.path);
-        return { content: [{ type: "text" as const, text: `Wrote ${params.path}` }], details: undefined };
+        staged.set(params.path, params.content);
+        return { content: [{ type: "text" as const, text: `Staged ${params.path}` }], details: undefined };
       },
     },
   ];
@@ -74,10 +74,29 @@ export interface ForkInput {
   maxTurns?: number;
 }
 
+/** Applies the sub-agent's staged files only after its loop finished, one atomic rename each. */
+export async function applyStaged(memoryDir: string, staged: Map<string, string>): Promise<string[]> {
+  if (!staged.size) return [];
+  const { mkdir, rename, unlink, writeFile } = await import("node:fs/promises");
+  const { randomUUID } = await import("node:crypto");
+  await mkdir(memoryDir, { recursive: true, mode: 0o700 });
+  for (const [name, content] of staged) {
+    const target = scopedPath(memoryDir, name);
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, content, { mode: 0o600 });
+      await rename(temporary, target);
+    } finally {
+      await unlink(temporary).catch(() => {});
+    }
+  }
+  return [...staged.keys()];
+}
+
 /** Bounded tool loop on the parent's registry: one assistant turn per iteration, no nested session. */
-export async function runForkExtraction(input: ForkInput): Promise<{ written: string[]; turns: number }> {
-  const written = new Set<string>();
-  const tools = memoryTools(input.memoryDir, written);
+export async function runForkExtraction(input: ForkInput): Promise<{ staged: Map<string, string>; turns: number }> {
+  const staged = new Map<string, string>();
+  const tools = memoryTools(input.memoryDir, staged);
   const declarations = tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters as never }));
   const byName = new Map(tools.map(tool => [tool.name, tool]));
   const messages: Message[] = [{
@@ -91,7 +110,7 @@ export async function runForkExtraction(input: ForkInput): Promise<{ written: st
     const reply = await input.modelRegistry.streamSimple(input.model, { messages, tools: declarations }, {
       maxTokens: 2000, reasoning: "low", cacheRetention: "none", signal: input.signal,
     }).result();
-    if (reply.stopReason !== "toolUse") return { written: [...written], turns };
+    if (reply.stopReason !== "toolUse") return { staged, turns };
     messages.push(reply);
     for (const call of reply.content.filter((part): part is ToolCall => part.type === "toolCall")) {
       const tool = byName.get(call.name);
@@ -101,5 +120,5 @@ export async function runForkExtraction(input: ForkInput): Promise<{ written: st
       messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
     }
   }
-  return { written: [...written], turns: limit };
+  return { staged, turns: limit };
 }

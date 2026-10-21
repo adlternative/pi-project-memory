@@ -7,7 +7,7 @@ import { clip, MemoryStore, projectIdentity, TYPES, type Memory } from "./store.
 import { search } from "./search.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
-import { runForkExtraction } from "./fork-extraction.ts";
+import { applyStaged, runForkExtraction } from "./fork-extraction.ts";
 
 const MemorySchema = Type.Object({
   id: Type.String(), type: Type.Union(TYPES.map(type => Type.Literal(type))),
@@ -142,9 +142,10 @@ export default function projectMemory(pi: ExtensionAPI) {
           model, modelRegistry: ctx.modelRegistry, memoryDir: memory.dir,
           evidence: input, index: snapshot.index, signal,
         });
-        await memory.read({ tolerant: true }).catch(() => undefined);
+        // Discard everything if the pass was cancelled: no partial notes.
         if (signal.aborted) return;
-        const ids = result.written.map(name => name.replace(/\.md$/, ""));
+        const ids = (await applyStaged(memory.dir, result.staged)).map(name => name.replace(/\.md$/, ""));
+        await memory.read({ tolerant: true }).catch(() => undefined);
         pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: ids, turns: result.turns, provider: model.provider, model: model.id, ...(requested ? { requestedModel: requested } : {}) });
         checkpoint();
         if (ctx.hasUI && ids.length) ctx.ui.notify(`Project memory: saved ${ids.length} note(s)`, "info");
