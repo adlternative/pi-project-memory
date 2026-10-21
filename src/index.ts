@@ -36,7 +36,10 @@ function result(memory: MemoryStore, notes: Memory[], truncated = false, nextOff
   return { content: [{ type: "text" as const, text: content }], details: data, structuredContent: data };
 }
 
-export interface MemorySettings { enabled: boolean; directory?: string; autoExtract: boolean; extractModel: string; dedicatedTools: boolean }
+export interface MemorySettings {
+  enabled: boolean; directory?: string; autoExtract: boolean; extractModel: string; dedicatedTools: boolean;
+  everyNTurns: number; idleFlushSeconds: number;
+}
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
 
 /** Configuration lives in Pi settings so it survives installs, like CC's autoMemory* keys. */
@@ -45,7 +48,14 @@ function readSettings(pi: ExtensionAPI): MemorySettings {
   const value = typeof section === "object" && section !== null ? section as Record<string, unknown> : {};
   const directory = typeof value.directory === "string" && value.directory.trim() ? value.directory.trim() : undefined;
   const extractModel = typeof value.extractModel === "string" && value.extractModel.trim() ? value.extractModel.trim() : DEFAULT_EXTRACT_MODEL;
-  return { enabled: value.enabled !== false, directory, autoExtract: value.autoExtract === true, extractModel, dedicatedTools: value.dedicatedTools === true };
+  const number = (input: unknown, fallback: number, min: number, max: number) =>
+    typeof input === "number" && Number.isFinite(input) ? Math.min(max, Math.max(min, input)) : fallback;
+  return {
+    enabled: value.enabled !== false, directory, autoExtract: value.autoExtract === true, extractModel,
+    dedicatedTools: value.dedicatedTools === true,
+    everyNTurns: Math.round(number(value.everyNTurns, 5, 1, 100)),
+    idleFlushSeconds: number(value.idleFlushSeconds, 120, 0, 86_400),
+  };
 }
 
 function expandDirectory(directory: string): string {
@@ -65,6 +75,9 @@ export default function projectMemory(pi: ExtensionAPI) {
   let epoch = 0;
   let lifecycle: AbortController | undefined;
   const jobs = new Set<Promise<void>>();
+  let turnsSinceExtract = 0;
+  let trailing = false;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let run: { prompt: string; wrote: boolean; attempted: boolean } | undefined;
   const enabled = () => readSettings(pi).enabled && pi.getFlag("memory-disabled") !== true;
   const rootFor = (cwd: string) => {
@@ -99,7 +112,7 @@ export default function projectMemory(pi: ExtensionAPI) {
   }
 
   /** One bounded no-tool model call, then our own validated write. Runs detached from the turn. */
-  async function extractAndSave(ctx: ExtensionContext, signal: AbortSignal) {
+  async function extractAndSave(ctx: ExtensionContext, signal: AbortSignal, leafAtStart: string | null, trigger: string) {
     if (!enabled() || !ctx.sessionManager.getSessionFile() || signal.aborted) return;
     const evidence = evidenceSinceCheckpoint(ctx);
     if (!evidence.some(entry => entry.role === "user" && entry.text.trim().length >= 4)) return;
@@ -124,9 +137,14 @@ export default function projectMemory(pi: ExtensionAPI) {
       response = answer.response;
       const drafts = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId());
       if (signal.aborted) return;
+      // Claude Code abandons a pass once a newer turn started: the evidence is stale by then.
+      if ((ctx.sessionManager.getLeafId() ?? null) !== leafAtStart) {
+        pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "stale", trigger });
+        return;
+      }
       const saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal });
       // Lifecycle callbacks cannot append a public UsageEntry; expose separate bookkeeping instead.
-      pi.appendEntry("pi-project-memory.extraction", { status: "ok", saved: saved.map(note => note.id), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+      pi.appendEntry("pi-project-memory.extraction", { status: "ok", trigger, saved: saved.map(note => note.id), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
       checkpoint();
       if (ctx.hasUI && saved.length) ctx.ui.notify(`Project memory: saved ${saved.length} note(s)`, "info");
     } catch {
@@ -134,6 +152,35 @@ export default function projectMemory(pi: ExtensionAPI) {
       pi.appendEntry("pi-project-memory.extraction", { status: "failed", ...(response ? { provider: response.provider, model: response.model, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
       if (ctx.hasUI) ctx.ui.notify("Project memory extraction failed; no notes changed. Retry /pmem extract after checking the provider/store.", "warning");
     }
+  }
+
+  function clearIdle() { if (idleTimer) { clearTimeout(idleTimer); idleTimer = undefined; } }
+
+  /** CC runs one pass at a time and stashes the next one as a trailing pass. */
+  function startExtraction(ctx: ExtensionContext, trigger: "cadence" | "idle" | "trailing" | "manual") {
+    if (!lifecycle) return;
+    if (jobs.size) { trailing = true; return; }
+    const leaf = ctx.sessionManager.getLeafId() ?? null;
+    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(20_000)]);
+    const job: Promise<void> = extractAndSave(ctx, signal, leaf, trigger).catch(() => {}).finally(() => {
+      jobs.delete(job);
+      if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
+    });
+    jobs.add(job);
+  }
+
+  function armIdleFlush(ctx: ExtensionContext) {
+    clearIdle();
+    const seconds = readSettings(pi).idleFlushSeconds;
+    if (seconds <= 0) return;
+    const timer = setTimeout(() => {
+      idleTimer = undefined;
+      if (!auto || !lifecycle || jobs.size) return;
+      turnsSinceExtract = 0;
+      startExtraction(ctx, "idle");
+    }, seconds * 1000);
+    timer.unref?.();
+    idleTimer = timer;
   }
 
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
@@ -161,16 +208,16 @@ export default function projectMemory(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", () => {
-    epoch++; lifecycle?.abort(); lifecycle = new AbortController(); store = undefined; run = undefined;
+    epoch++; clearIdle(); lifecycle?.abort(); lifecycle = new AbortController(); store = undefined; run = undefined; turnsSinceExtract = 0; trailing = false;
     const flag = pi.getFlag("memory-auto");
     auto = typeof flag === "boolean" ? flag : readSettings(pi).autoExtract;
     // Default parity with Claude Code and Codex: the memory directory is the interface, so tools are opt-in.
     if (!readSettings(pi).dedicatedTools) pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("pmem_")));
   });
   pi.on("session_shutdown", async () => {
-    epoch++; run = undefined; store = undefined;
-    // Bounded drain so a save started just before quit is not lost; CC drains for 60s, we cap at 5s.
-    if (jobs.size) await Promise.race([Promise.allSettled([...jobs]), new Promise(resolve => { const timer = setTimeout(resolve, 5_000); timer.unref?.(); })]);
+    epoch++; clearIdle(); run = undefined; store = undefined;
+    // Bounded drain so a save started just before quit is not lost; CC drains for 60s, we cap at 15s.
+    if (jobs.size) await Promise.race([Promise.allSettled([...jobs]), new Promise(resolve => { const timer = setTimeout(resolve, 15_000); timer.unref?.(); })]);
     lifecycle?.abort();
     lifecycle = undefined;
   });
@@ -195,14 +242,16 @@ export default function projectMemory(pi: ExtensionAPI) {
     return { message: { customType: INDEX_ENTRY, content: JSON.stringify(data), display: false } };
   });
 
+  pi.on("turn_start", () => clearIdle());
   pi.on("turn_end", (event, ctx) => {
+    clearIdle();
     if (!auto || !run || run.attempted || run.wrote || ctx.hasPendingMessages() || event.message.role !== "assistant" || event.message.stopReason !== "stop") return;
     run.attempted = true;
     if (!lifecycle) return;
-    // Parity with Claude Code: the extraction runs detached so the turn settles immediately.
-    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(20_000)]);
-    const job: Promise<void> = extractAndSave(ctx, signal).catch(() => {}).finally(() => { jobs.delete(job); });
-    jobs.add(job);
+    // Detached so the turn settles immediately; cadence and idle flush mirror Claude Code.
+    turnsSinceExtract += 1;
+    if (turnsSinceExtract >= readSettings(pi).everyNTurns) { turnsSinceExtract = 0; startExtraction(ctx, "cadence"); return; }
+    armIdleFlush(ctx);
   });
   pi.on("agent_before_settle", (event, ctx) => {
     if (!auto || !run || event.outcome !== "completed" || ctx.hasPendingMessages()) return;
@@ -268,7 +317,7 @@ export default function projectMemory(pi: ExtensionAPI) {
       }
       if (action === "extract") {
         if (!enabled() || !ctx.sessionManager.getSessionFile()) throw new Error("Extraction requires an enabled, persistent session");
-        await extractAndSave(ctx, AbortSignal.any([AbortSignal.timeout(30_000), ...(ctx.signal ? [ctx.signal] : [])]));
+        await extractAndSave(ctx, AbortSignal.any([AbortSignal.timeout(30_000), ...(ctx.signal ? [ctx.signal] : [])]), ctx.sessionManager.getLeafId() ?? null, "manual");
         report("Memory extraction attempted; /pmem list shows stored notes. Usage/status is recorded as pi-project-memory.extraction entries."); return;
       }
       const memory = await getStore(ctx);

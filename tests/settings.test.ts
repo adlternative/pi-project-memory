@@ -136,3 +136,29 @@ test("dedicatedTools:true keeps the pmem tools available", async t => {
   const h = await makeHarness(t, { useFlags: false, dedicatedTools: true });
   assert.deepEqual(h.session.getActiveToolNames().sort(), ["pmem_list", "pmem_read", "pmem_save", "pmem_search"]);
 });
+
+test("everyNTurns counts prompts, and idle flush covers the gap", async t => {
+  const h = await makeHarness(t, {
+    useFlags: false,
+    settings: { projectMemory: { autoExtract: true, everyNTurns: 2, idleFlushSeconds: 0 } },
+    answer: request => (request.kind === "extract" ? '{"memories":[]}' : "Done."),
+  });
+  await h.session.prompt("First prompt with a durable preference.");
+  assert.deepEqual(h.requests.map(request => request.kind), ["main"]);
+  await h.session.prompt("Second prompt mentioning another preference.");
+  await waitForExtraction(h);
+  assert.deepEqual(h.requests.map(request => request.kind), ["main", "main", "extract"]);
+});
+
+test("idle flush runs a pass after the turn settles, without waiting for the cadence", async t => {
+  const h = await makeHarness(t, {
+    useFlags: false,
+    settings: { projectMemory: { autoExtract: true, everyNTurns: 99, idleFlushSeconds: 0.05 } },
+    answer: request => (request.kind === "extract" ? '{"memories":[]}' : "Done."),
+  });
+  await h.session.prompt("One prompt that should be flushed while idle.");
+  await waitForExtraction(h);
+  const entry = h.manager.getEntries().find(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction");
+  assert.ok(entry && entry.type === "custom");
+  assert.equal((entry.data as { trigger?: string }).trigger, "idle");
+});

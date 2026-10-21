@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { Type } from "typebox";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { MemoryFiles } from "../../src/files.ts";
-import { clip, projectIdentity } from "../../src/store.ts";
+import { clip, MemoryStore, projectIdentity } from "../../src/store.ts";
 import { validId } from "../../src/model.ts";
 
 /** Tests run read-only, without network or fork. The parent Pi alone can edit the approved source file. */

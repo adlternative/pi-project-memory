@@ -44,7 +44,7 @@ if (stage.name === "project-baseline" || stage.name === "project-red" || stage.n
   await writeFile(join(output, "result.json"), JSON.stringify(data, null, 2));
   console.log(JSON.stringify({ stage: stage.name, ...data }));
 } else {
-  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, cacheWarming: "off", retry: { enabled: false, provider: { timeoutMs: 45000, maxRetries: 0 } }, defaultProjectTrust: "never", enableInstallTelemetry: false });
+  const settings = SettingsManager.inMemory({ projectMemory: { everyNTurns: 1, idleFlushSeconds: 0 }, compaction: { enabled: false }, cacheWarming: "off", retry: { enabled: false, provider: { timeoutMs: 45000, maxRetries: 0 } }, defaultProjectTrust: "never", enableInstallTelemetry: false } as never);
   const loader = new DefaultResourceLoader({ cwd: project, agentDir, settingsManager: settings, noExtensions: true, additionalExtensionPaths: [join(lab, "src/index.ts")], extensionFactories: [liveEnvironment({ project, memoryBase, checks, editSource: stage.editSource === true })], noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true });
   await loader.reload();
   const extensions = loader.getExtensions();

@@ -13,6 +13,8 @@ for name in ["home", "agent", "project", "sessions", "tmp", "cache"]:
 node = os.environ.get("PI_MEMORY_TEST_NODE") or shutil.which("node")
 cli = (lab / "node_modules/@earendil-works/pi-coding-agent/dist/cli.js").resolve()
 trace = root / "trace.jsonl"
+settings_path = root / "agent" / "settings.json"
+settings_path.write_text(json.dumps({"projectMemory": {"everyNTurns": 1, "idleFlushSeconds": 0, "dedicatedTools": True}}))
 extension = Path(os.environ.get("PI_MEMORY_TEST_EXTENSION", str(lab / "src/index.ts"))).resolve()
 file_tools = os.environ.get("PI_MEMORY_TEST_FILE_TOOLS") == "1"
 env = {

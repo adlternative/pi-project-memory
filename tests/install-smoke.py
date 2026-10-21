@@ -33,6 +33,9 @@ subprocess.run([pi, 'install', source], env=env, check=True, capture_output=True
 settings = json.loads((agent / 'settings.json').read_text())
 assert source in settings.get('packages', []), settings
 
+settings['projectMemory'] = {'everyNTurns': 1, 'idleFlushSeconds': 0}
+(agent / 'settings.json').write_text(json.dumps(settings, indent=2))
+
 listed = subprocess.run([pi, 'list'], env=env, check=True, capture_output=True, text=True, timeout=120).stdout
 assert source in listed, listed
 
