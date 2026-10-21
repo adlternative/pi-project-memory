@@ -5,7 +5,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { getCurrentTools } from "@earendil-works/pi-ai";
 import { evidenceSinceCheckpoint } from "../src/intelligence.ts";
 import { clip } from "../src/store.ts";
-import { extraction, makeHarness, tool } from "./harness.ts";
+import { extraction, makeHarness, tool, waitForExtraction } from "./harness.ts";
 
 const noteArgs = { id: "package-manager", type: "feedback", title: "Package manager", content: "Use pnpm, not npm, to install dependencies." };
 
@@ -63,6 +63,7 @@ test("a fresh Pi session loads the index once and leaves topic bodies on disk", 
 test("opt-in turn-end extraction is bounded, no-tool, source-grounded and incremental across resume", async t => {
   const h = await makeHarness(t, { auto: true, answer: request => request.kind === "extract" ? extraction(request) : "Done." });
   await h.session.prompt("Please prefer pnpm over npm for this project.");
+  await waitForExtraction(h);
   assert.equal((await h.store.read()).notes[0].source.origin, "extracted");
   const call = h.requests.find(request => request.kind === "extract")!;
   assert.deepEqual(getCurrentTools(call.context.messages), []);
@@ -72,6 +73,7 @@ test("opt-in turn-end extraction is bounded, no-tool, source-grounded and increm
   const path = h.manager.getSessionFile(); assert.ok(path);
   const resumed = await makeHarness(t, { root: h.root, auto: true, sessionManager: SessionManager.open(path), answer: request => request.kind === "extract" ? '{"memories":[]}' : "Done." });
   await resumed.session.prompt("We now prefer short design notes for future reviews.");
+  await waitForExtraction(resumed);
   const resumedCall = resumed.requests.find(request => request.kind === "extract")!;
   assert.equal(JSON.stringify(resumedCall.data.evidence).includes("prefer pnpm over npm"), false);
   assert.ok(JSON.stringify(resumedCall.data.evidence).includes("short design notes"));
@@ -100,6 +102,7 @@ test("an error or aborted main run cannot become a durable memory", async t => {
 test("invalid extraction fails closed without damaging a successful conversation", async t => {
   const h = await makeHarness(t, { auto: true, answer: request => request.kind === "extract" ? '{"memories":[{"id":"invented"}]}' : "Task succeeded." });
   await h.session.prompt("Some durable information might exist here.");
+  await waitForExtraction(h);
   assert.equal(h.session.getLastAssistantText(), "Task succeeded.");
   assert.deepEqual((await h.store.read()).notes, []);
   const entries = extractionEntries(h);
@@ -112,6 +115,7 @@ test("known credential values are removed before extraction; raw tool/system con
   const token = "sk-" + "f".repeat(32);
   const h = await makeHarness(t, { auto: true, answer: request => request.kind === "extract" ? '{"memories":[]}' : "Done." });
   await h.session.prompt("Remember the deployment preference; credential for this one task is " + token);
+  await waitForExtraction(h);
   const input = JSON.stringify(h.requests.find(request => request.kind === "extract")!.data);
   assert.equal(input.includes(token), false);
   assert.ok(input.includes("[REDACTED]"));
@@ -155,6 +159,7 @@ test("a concurrent edit during extraction rejects the stale model result", async
     return extraction(request);
   } });
   await h.session.prompt("Old preference: we use pnpm in this project.");
+  await waitForExtraction(h);
   assert.equal((await h.store.read()).notes[0].content, "Newer explicit choice: use bun.");
   assert.equal(extractionEntries(h).length, 1);
   assert.equal(extractionEntries(h)[0].type === "custom" && (extractionEntries(h)[0].data as any).status, "failed");

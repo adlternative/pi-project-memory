@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readdir } from "node:fs/promises";
 import { MemoryStore, projectIdentity } from "../src/store.ts";
-import { makeHarness, tool } from "./harness.ts";
+import { makeHarness, tool, waitForExtraction } from "./harness.ts";
 
 const note = { id: "package-manager", type: "feedback" as const, title: "Package manager", content: "Use pnpm, not npm, to install dependencies." };
 const source = { sessionId: "old", entryId: "old-user", quote: "pnpm", origin: "explicit" as const };
@@ -66,6 +66,34 @@ test("autoExtract:true persists the opt-in so extraction runs without the flag",
     answer: request => (request.kind === "extract" ? JSON.stringify({ memories: [] }) : "Done."),
   });
   await h.session.prompt("We prefer pnpm over npm for future work in this repository.");
+  await waitForExtraction(h);
   assert.deepEqual(h.requests.map(request => request.kind), ["main", "extract"]);
   assert.deepEqual(h.errors, []);
+});
+
+test("extractModel runs extraction on its own model, leaving the session model alone", async t => {
+  const h = await makeHarness(t, {
+    useFlags: false,
+    settings: { projectMemory: { autoExtract: true, extractModel: "memory-test/synthetic-fast" } },
+    answer: request => (request.kind === "extract" ? '{"memories":[]}' : "Done."),
+  });
+  await h.session.prompt("We prefer pnpm over npm for future work in this repository.");
+  await waitForExtraction(h);
+  assert.equal(h.requests.find(request => request.kind === "main")?.model, "synthetic");
+  assert.equal(h.requests.find(request => request.kind === "extract")?.model, "synthetic-fast");
+  assert.deepEqual(h.errors, []);
+});
+
+test("an unavailable extractModel falls back to the session model and records the request", async t => {
+  const h = await makeHarness(t, {
+    useFlags: false,
+    settings: { projectMemory: { autoExtract: true, extractModel: "qoder/fast" } },
+    answer: request => (request.kind === "extract" ? '{"memories":[]}' : "Done."),
+  });
+  await h.session.prompt("We prefer pnpm over npm for future work in this repository.");
+  await waitForExtraction(h);
+  assert.equal(h.requests.find(request => request.kind === "extract")?.model, "synthetic");
+  const entry = h.manager.getEntries().find(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction");
+  assert.ok(entry && entry.type === "custom");
+  assert.equal((entry.data as { requestedModel?: string }).requestedModel, "qoder/fast");
 });

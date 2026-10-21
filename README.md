@@ -183,6 +183,7 @@ Configure memory in Pi settings, so it applies to every session after installati
 | `enabled` | `true` | Master switch. `false` stops recall, writes, and extraction without deleting saved notes |
 | `directory` | `<agent-dir>/project-memory` | Base directory for all project stores. Absolute, or starting with `~/` |
 | `autoExtract` | `false` | Opt in to one bounded extraction call after a successful persistent turn |
+| `extractModel` | `qoder/fast` | Model used for extraction, as `provider/model` or a bare id. Falls back to the session model when unavailable, recording `requestedModel` |
 
 These are the counterpart of Claude Code's `autoMemoryEnabled` and `autoMemoryDirectory`. Run `/reload` after editing settings; `/pmem` confirms the resolved directory and state.
 
@@ -208,9 +209,11 @@ Recall loads once per session:
 - The message is written to the conversation once per session, so it survives a resume but never repeats. A compaction that drops it makes the next run inject the index again.
 - Only fixed `project_memory` usage rules are added to the prompt. Your system prompt and `SYSTEM.md` are not replaced.
 
-Search is local BM25 with title weight 3 and description/body weight 1. English words are folded by common suffixes (`installation` → `install`, `dependencies` → `dependency`). CJK text is indexed as characters and bigrams, but queries use only bigrams (a lone character still matches) so common characters such as 的/我 do not pull in unrelated notes. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
+Search is local BM25 with title weight 3 and description/body weight 1. English words are folded by common suffixes (`installation` → `install`, `dependencies` → `dependency`). CJK text is indexed as characters and bigrams, but queries use only bigrams (a lone character still matches), so very common characters do not pull in unrelated notes. `pmem_search({mode: "semantic"})` asks the current model to pick from up to 48 candidate previews; it is not a vector index, so it can miss notes whose wording is far from the query.
 
-Automatic extraction is off unless `projectMemory.autoExtract` (or `--memory-auto`) enables it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each). System prompts, thinking, tool output, and abandoned branches are excluded. Failed, aborted, or stale candidates are discarded.
+Automatic extraction is off unless `projectMemory.autoExtract` (or `--memory-auto`) enables it. When on, a successful persistent turn makes at most one no-tool model call over the latest 12 new user/final-assistant texts (1,000 bytes each), using `projectMemory.extractModel` (`qoder/fast` by default). System prompts, thinking, tool output, and abandoned branches are excluded. Failed or stale candidates are discarded.
+
+The call runs **detached**, like Claude Code: the turn settles immediately and memory is written afterwards. A stale result is rejected by revision check, a shutdown drains in-flight work for up to five seconds, and progress is recorded as `pi-project-memory.extraction` entries. `/pmem extract` runs the same pass synchronously.
 
 | Resource | Limit |
 |---|---:|

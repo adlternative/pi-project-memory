@@ -1,28 +1,47 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readdir } from "node:fs/promises";
-import { makeHarness, tool } from "./harness.ts";
+import { makeHarness, tool, waitForExtraction } from "./harness.ts";
 
 const source = { sessionId: "s".repeat(170), entryId: "e".repeat(170), quote: "Synthetic user evidence", origin: "explicit" as const };
 
-test("aborting an in-flight extraction cancels it without committing or checkpointing", { timeout: 15000 }, async t => {
-  let ready!: () => void;
-  const started = new Promise<void>(resolve => { ready = resolve; });
-  let observedAbort = false;
+test("aborting a turn starts no extraction and commits nothing", { timeout: 15000 }, async t => {
+  let started!: () => void;
+  const answering = new Promise<void>(resolve => { started = resolve; });
   const h = await makeHarness(t, { auto: true, answer: async request => {
-    if (request.kind !== "extract") return "Task complete.";
-    ready();
-    assert.ok(request.options?.signal);
-    await new Promise<void>(resolve => request.options!.signal!.addEventListener("abort", () => { observedAbort = true; resolve(); }, { once: true }));
+    assert.equal(request.kind, "main");
+    started();
+    // Hold the turn open until the user aborts it.
+    await new Promise<void>(resolve => request.options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
     return { stopReason: "aborted", text: "Synthetic cancellation" };
   } });
   const running = h.session.prompt("We prefer pnpm rather than npm for future work.");
-  await started;
+  await answering;
   await h.session.abort();
   await running;
-  assert.equal(observedAbort, true);
   assert.deepEqual((await h.store.read()).notes, []);
+  assert.equal(h.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction"), false);
   assert.equal(h.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "pi-project-memory.checkpoint"), false);
+});
+
+test("extraction runs detached: the turn settles before the memory call finishes", { timeout: 20000 }, async t => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  const h = await makeHarness(t, { auto: true, answer: async request => {
+    if (request.kind !== "extract") return "Task complete.";
+    started();
+    await gate;
+    return '{"memories":[]}';
+  } });
+  await h.session.prompt("We prefer pnpm rather than npm for future work.");
+  // prompt() resolved while the extraction is still blocked, which is the point of detaching it.
+  await entered;
+  assert.equal(h.session.isIdle, true);
+  assert.equal(h.manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction"), false);
+  release();
+  await waitForExtraction(h);
 });
 
 test("cancelled writes and the hard note-count limit leave prior data intact", async t => {
@@ -52,6 +71,7 @@ test("worst-case escaped evidence is trimmed before a nested model call, not upl
   for (let i = 0; i < 24; i++) await h.store.save([{ id: "escaped-" + i, type: "project", title: '"\\'.repeat(60), content: '"\\'.repeat(700) + i, source }]);
   for (let i = 0; i < 12; i++) h.manager.appendMessage({ role: "user", content: '"\\'.repeat(490) + i, timestamp: Date.now() });
   await h.session.prompt("Remember only useful reusable facts from this session.");
+  await waitForExtraction(h);
   const call = h.requests.find(request => request.kind === "extract");
   assert.ok(call);
   assert.ok(Buffer.byteLength(JSON.stringify(call.data)) <= 30000);

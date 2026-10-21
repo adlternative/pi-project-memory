@@ -16,7 +16,8 @@ const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/
 const allowed = (name: string) => ["MEMORY.md", ".state.json", "memories.json", ".legacy-memories.json", ".pending.json"].includes(name) || (name.endsWith(".md") && validId(name.slice(0, -3)));
 const limit = (name: string) => name === ".pending.json" ? 4 * MIB : name === "MEMORY.md" ? INDEX_BYTES : name.endsWith(".md") ? TOPIC_BYTES : MIB;
 
-const LOCK_WAIT_MS = 3000;
+// Waiting is only for a live owner; a suite running many writers in parallel can exceed a short budget.
+const LOCK_WAIT_MS = 10_000;
 
 /** A lock whose owner is a dead process on this host. Unknown/foreign/unparseable locks are never reclaimed. */
 function deadOwner(text: string): boolean {

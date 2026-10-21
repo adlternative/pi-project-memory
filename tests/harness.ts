@@ -11,7 +11,7 @@ import {
 import { MemoryStore, projectIdentity } from "../src/store.ts";
 import { createMemorySandboxGuard } from "../sandbox-guard.ts";
 
-export interface Request { kind: "main" | "extract" | "semantic"; context: TranscriptContext; options?: SimpleStreamOptions; data?: any }
+export interface Request { kind: "main" | "extract" | "semantic"; model: string; context: TranscriptContext; options?: SimpleStreamOptions; data?: any }
 export type Reply = string | ToolCall | { stopReason: "error" | "aborted"; text: string };
 const usage = () => ({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 export function syntheticStream(model: Model<string>, context: TranscriptContext, options: SimpleStreamOptions | undefined, answer: (request: Request) => Reply | Promise<Reply>, requests: Request[]) {
@@ -21,7 +21,7 @@ export function syntheticStream(model: Model<string>, context: TranscriptContext
     const kind = prompt.startsWith("Extract at most") ? "extract" : prompt.startsWith("Select up to 5 memory ids") ? "semantic" : "main";
     const last = context.messages.findLast(message => message.role === "user");
     const text = last ? typeof last.content === "string" ? last.content : last.content.filter(part => part.type === "text").map(part => part.text).join("\n") : "";
-    const request: Request = { kind, context, options, ...(kind !== "main" ? { data: JSON.parse(text) } : {}) };
+    const request: Request = { kind, model: model.id, context, options, ...(kind !== "main" ? { data: JSON.parse(text) } : {}) };
     requests.push(request);
     const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), content: [], usage: usage(), stopReason: "pending" };
     try {
@@ -67,7 +67,10 @@ export async function makeHarness(t: { after(fn: () => Promise<void>): void }, o
   const requests: Request[] = [];
   runtime.registerProvider("memory-test", {
     api: "memory-test-api", apiKey: "synthetic-not-a-real-credential", baseUrl: "http://127.0.0.1:1",
-    models: [{ id: "synthetic", name: "Synthetic memory test", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+    models: [
+      { id: "synthetic", name: "Synthetic memory test", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+      { id: "synthetic-fast", name: "Synthetic fast", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    ],
     streamSimple: (model, context, settings) => syntheticStream(model, context, settings, options.answer ?? (() => "Done."), requests),
   });
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off", defaultProjectTrust: "never", enableInstallTelemetry: false, ...options.settings } as never);
@@ -101,3 +104,18 @@ export function extraction(request: Request, content = "Use pnpm, not npm, to in
   return JSON.stringify({ memories: [{ id: "package-manager", type: "feedback", title: "Package manager", content, entryId: evidence.entryId, quote: evidence.text }] });
 }
 export const tool = (name: string, args: JsonObject): ToolCall => ({ type: "toolCall", id: "call-" + name, name, arguments: args });
+
+/** Extraction is detached, so tests wait for its bookkeeping entry instead of assuming it finished. */
+export function extractionCount(h: Awaited<ReturnType<typeof makeHarness>>): number {
+  return h.manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction").length;
+}
+
+export async function waitForExtraction(h: Awaited<ReturnType<typeof makeHarness>>, timeoutMs = 20_000): Promise<void> {
+  const target = extractionCount(h) + 1;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (extractionCount(h) >= target) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error("memory extraction did not finish in time");
+}
