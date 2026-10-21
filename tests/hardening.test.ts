@@ -83,15 +83,15 @@ test("saving identical content under a new id returns the existing note untouche
 });
 
 test("credential rules keep prose but still catch secret-shaped values", () => {
-  for (const prose of ["password: 请找运维申请", "CI 的 token: 存在 Vault 里", "secret=见 1Password", "token=environment"]) assert.equal(redact(prose), prose);
+  for (const prose of ["password: \u8bf7\u627e\u8fd0\u7ef4\u7533\u8bf7", "CI \u7684 token: \u5b58\u5728 Vault \u91cc", "secret=\u89c1 1Password", "token=environment"]) assert.equal(redact(prose), prose);
   for (const secret of ["password: hunter22", "api_key=\"abcd1234efgh\"", "password=correcthorsebatterystaple"]) assert.match(redact(secret), /\[REDACTED\]/);
 });
 
 test("search folds English suffixes and ignores single-character Chinese noise", () => {
   const note = (id: string, title: string, content: string): Memory => ({ ...d(id, content, title), createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" });
-  const notes = [note("identity", "用户姓名：德烈", "用户称呼为德烈"), note("pkg", "Package manager", "Use pnpm to install dependencies")];
+  const notes = [note("identity", "\u7528\u6237\u59d3\u540d\uff1a\u5fb7\u70c8", "\u7528\u6237\u79f0\u547c\u4e3a\u5fb7\u70c8"), note("pkg", "Package manager", "Use pnpm to install dependencies")];
   for (const q of ["installation", "dependency", "packages"]) assert.equal(search(notes, q)[0]?.note.id, "pkg", q);
-  assert.deepEqual(search(notes, "我们的数据库连接怎么配"), []);
-  assert.equal(search(notes, "德烈")[0].note.id, "identity");
-  assert.equal(search(notes, "烈")[0]?.note.id, "identity", "a lone character still matches");
+  assert.deepEqual(search(notes, "\u6211\u4eec\u7684\u6570\u636e\u5e93\u8fde\u63a5\u600e\u4e48\u914d"), []);
+  assert.equal(search(notes, "\u5fb7\u70c8")[0].note.id, "identity");
+  assert.equal(search(notes, "\u70c8")[0]?.note.id, "identity", "a lone character still matches");
 });
