@@ -93,7 +93,9 @@ Review what was saved:
 
 ## Tools and commands
 
-| Tool | Purpose |
+By default there are **no memory tools**. The model reads and writes the Markdown files with its ordinary file tools, which is how Claude Code works and how Codex ships (`dedicated_tools = false`). Set `"dedicatedTools": true` when the model has no shell or file tools, or when you want BM25/semantic search without a shell.
+
+| Tool (opt-in) | Purpose |
 |---|---|
 | `pmem_list({offset?})` | Ten previews per page with relative `.md` paths and `nextOffset` |
 | `pmem_read({id})` | One complete note with its path and provenance |
@@ -184,6 +186,7 @@ Configure memory in Pi settings, so it applies to every session after installati
 | `directory` | `<agent-dir>/project-memory` | Base directory for all project stores. Absolute, or starting with `~/` |
 | `autoExtract` | `false` | Opt in to one bounded extraction call after a successful persistent turn |
 | `extractModel` | `qoder/fast` | Model used for extraction, as `provider/model` or a bare id. Falls back to the session model when unavailable, recording `requestedModel` |
+| `dedicatedTools` | `false` | Expose `pmem_list`/`pmem_read`/`pmem_search`/`pmem_save`. Off by default: like Claude Code and Codex, the memory directory is the interface and ordinary `read`/`edit`/`write` do the work |
 
 These are the counterpart of Claude Code's `autoMemoryEnabled` and `autoMemoryDirectory`. Run `/reload` after editing settings; `/pmem` confirms the resolved directory and state.
 

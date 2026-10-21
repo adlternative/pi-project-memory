@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readdir } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { MemoryStore, projectIdentity } from "../src/store.ts";
+import { renderTopic } from "../src/markdown.ts";
 import { makeHarness, tool, waitForExtraction } from "./harness.ts";
 
 const note = { id: "package-manager", type: "feedback" as const, title: "Package manager", content: "Use pnpm, not npm, to install dependencies." };
@@ -96,4 +98,41 @@ test("an unavailable extractModel falls back to the session model and records th
   const entry = h.manager.getEntries().find(entry => entry.type === "custom" && entry.customType === "pi-project-memory.extraction");
   assert.ok(entry && entry.type === "custom");
   assert.equal((entry.data as { requestedModel?: string }).requestedModel, "qoder/fast");
+});
+
+test("by default there are no memory tools, and a plain Markdown file is the interface", async t => {
+  const h = await makeHarness(t, { useFlags: false, dedicatedTools: false });
+  assert.deepEqual(h.session.getActiveToolNames(), []);
+  // The directory has to reach the model even before anything exists, since no tool can report it.
+  await h.session.prompt("What do you know about this project?");
+  const injected = h.manager.getEntries().find(entry => entry.type === "custom_message" && entry.customType === "pi-project-memory.index");
+  assert.ok(injected && injected.type === "custom_message", "expected the directory pointer");
+  const identity = await projectIdentity(h.cwd);
+  // Without overrides the plugin resolves its base from the process agent dir, not the harness option.
+  const dir = join(getAgentDir(), "project-memory", `${identity.name}__${identity.key.slice(0, 12)}`);
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  assert.equal(JSON.parse(String(injected.content)).directory, dir);
+
+  // Writing the topic file by hand is enough: the plugin ingests it into the index.
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const store = new MemoryStore(join(getAgentDir(), "project-memory"), identity.key, identity.name);
+  await writeFile(join(dir, "package-manager.md"), renderTopic({
+    ...note,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    source,
+  }));
+  assert.equal((await store.read()).notes.length, 1);
+
+  const cold = await makeHarness(t, { root: h.root, useFlags: false, dedicatedTools: false });
+  await cold.session.prompt("How should I install dependencies in this project?");
+  // Recall injects the index; bodies stay on disk and are read on demand (CC parity).
+  assert.ok(JSON.stringify(cold.requests[0].context).includes("(package-manager.md)"));
+  assert.equal((await store.read()).notes[0].content, "Use pnpm, not npm, to install dependencies.");
+  assert.deepEqual(cold.session.getActiveToolNames(), []);
+});
+
+test("dedicatedTools:true keeps the pmem tools available", async t => {
+  const h = await makeHarness(t, { useFlags: false, dedicatedTools: true });
+  assert.deepEqual(h.session.getActiveToolNames().sort(), ["pmem_list", "pmem_read", "pmem_save", "pmem_search"]);
 });

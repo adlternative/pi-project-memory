@@ -55,7 +55,7 @@ export function syntheticStream(model: Model<string>, context: TranscriptContext
 
 export async function makeHarness(t: { after(fn: () => Promise<void>): void }, options: {
   root?: string; project?: string; auto?: boolean; disabled?: boolean; persistent?: boolean; fileTools?: boolean;
-  settings?: Record<string, unknown>; useFlags?: boolean;
+  settings?: Record<string, unknown>; useFlags?: boolean; dedicatedTools?: boolean;
   sessionManager?: SessionManager; answer?: (request: Request) => Reply | Promise<Reply>;
 } = {}) {
   await mkdir(resolve(".sandbox"), { recursive: true });
@@ -73,7 +73,10 @@ export async function makeHarness(t: { after(fn: () => Promise<void>): void }, o
     ],
     streamSimple: (model, context, settings) => syntheticStream(model, context, settings, options.answer ?? (() => "Done."), requests),
   });
-  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off", defaultProjectTrust: "never", enableInstallTelemetry: false, ...options.settings } as never);
+  // Tool-driven tests opt in; the default configuration exposes no memory tools, like CC.
+  const supplied = (options.settings?.projectMemory ?? {}) as Record<string, unknown>;
+  const projectMemory = { dedicatedTools: options.dedicatedTools ?? true, ...supplied };
+  const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off", defaultProjectTrust: "never", enableInstallTelemetry: false, ...options.settings, projectMemory } as never);
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, additionalExtensionPaths: [resolve("src/index.ts")], extensionFactories: options.fileTools ? [createMemorySandboxGuard(memoryDir)] : [], noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
   await loader.reload();
   const loaded = loader.getExtensions();
