@@ -214,8 +214,12 @@ export default function projectMemory(pi: ExtensionAPI) {
     // Default parity with Claude Code and Codex: the memory directory is the interface, so tools are opt-in.
     if (!readSettings(pi).dedicatedTools) pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("pmem_")));
   });
-  pi.on("session_shutdown", async () => {
-    epoch++; clearIdle(); run = undefined; store = undefined;
+  pi.on("session_shutdown", async (_event, ctx) => {
+    epoch++; run = undefined; store = undefined;
+    // CC flushes pending idle work at shutdown instead of dropping it.
+    const pendingIdle = idleTimer !== undefined;
+    clearIdle();
+    if (auto && lifecycle && (pendingIdle || trailing)) startExtraction(ctx, pendingIdle ? "idle" : "trailing");
     // Bounded drain so a save started just before quit is not lost; CC drains for 60s, we cap at 15s.
     if (jobs.size) await Promise.race([Promise.allSettled([...jobs]), new Promise(resolve => { const timer = setTimeout(resolve, 15_000); timer.unref?.(); })]);
     lifecycle?.abort();
