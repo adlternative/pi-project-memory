@@ -1,17 +1,38 @@
 {
   "name": "pi-project-memory",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "private": true,
   "description": "Project-scoped persistent memory for Pi, with bounded recall and opt-in extraction",
   "type": "module",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/adlternative/pi-project-memory.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adlternative/pi-project-memory.git"
+  },
   "homepage": "https://github.com/adlternative/pi-project-memory#readme",
-  "bugs": { "url": "https://github.com/adlternative/pi-project-memory/issues" },
-  "keywords": ["pi-package"],
-  "files": ["src", "README.md", "RESEARCH.md", "run-sandbox.sh", "sandbox-guard.ts", "LICENSE"],
-  "pi": { "extensions": ["./src/index.ts"] },
-  "engines": { "node": ">=22.19.0" },
+  "bugs": {
+    "url": "https://github.com/adlternative/pi-project-memory/issues"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "DEVELOPMENT.md",
+    "RESEARCH.md",
+    "run-sandbox.sh",
+    "sandbox-guard.ts",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
