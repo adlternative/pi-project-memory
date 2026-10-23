@@ -53,7 +53,7 @@ Run `/reload` in a running session, or restart Pi, so the extension loads.
 
 ```bash
 pi list      # shows the installed package
-pi --help    # lists --memory-dir, --memory-auto, --memory-disabled
+pi --help    # lists --memory-dir, --memory-auto, --memory-dream, --memory-disabled
 ```
 
 Inside a session, `/pmem` prints the memory directory for the current project.
@@ -139,7 +139,11 @@ Configure memory in Pi settings so it survives installs. Use user scope (`~/.pi/
     "dedicatedTools": false,
     "everyNTurns": 5,
     "idleFlushSeconds": 120,
-    "extractionMode": "call"
+    "extractionMode": "call",
+    "autoDream": false,
+    "dreamMinHours": 24,
+    "dreamMinSessions": 5,
+    "dreamRetryHours": 1
   }
 }
 ```
@@ -154,6 +158,10 @@ Configure memory in Pi settings so it survives installs. Use user scope (`~/.pi/
 | `everyNTurns` | `5` | Run one extraction pass every N user prompts |
 | `idleFlushSeconds` | `120` | Also run a pass after this much inactivity; `0` disables it |
 | `extractionMode` | `"call"` | `"call"` sends one no-tool JSON request; `"fork"` runs a bounded sub-agent with two memory-only tools |
+| `autoDream` | `false` | Opt in to a separate consolidation pass. It does not replace extraction |
+| `dreamMinHours` | `24` | Minimum hours since the last successful dream |
+| `dreamMinSessions` | `5` | Other persistent sessions touched since that dream. The current session does not count |
+| `dreamRetryHours` | `1` | After a failed dream, wait this long before an automatic retry. `0` retries on the next session |
 
 Per-run overrides exist for experiments and automation; a flag affects only the process it is passed to. Precedence is flag, then settings, then default.
 
@@ -161,6 +169,7 @@ Per-run overrides exist for experiments and automation; a flag affects only the 
 |---|---|
 | `--memory-dir <path>` | `directory` |
 | `--memory-auto` | `autoExtract` |
+| `--memory-dream` | `autoDream` |
 | `--memory-disabled` | `enabled` (forces off) |
 
 ## Tools and commands
@@ -184,6 +193,8 @@ Structured output is `{directory,indexPath,notes,truncated,nextOffset}`; each `n
 | `/pmem forget <id>` | Delete the topic, drop its link, record a tombstone |
 | `/pmem auto on\|off` | Toggle extraction for this session only |
 | `/pmem extract` | Run a pass now, synchronously |
+| `/pmem dream` | Consolidate now: merge, correct, and tombstone. Ignores the schedule |
+| `/pmem dream on\|off` | Toggle automatic dreaming for this session only |
 
 ## When memory is written
 
@@ -194,6 +205,7 @@ Five paths can write:
 3. Background extraction, when `autoExtract` is on: every `everyNTurns` prompts, after `idleFlushSeconds` of inactivity, or once as a trailing pass if a pass was already running.
 4. `/pmem extract`.
 5. `/pmem forget` removes a note.
+6. Dreaming, when `autoDream` is on or you run `/pmem dream`. A dream may update notes and forget duplicates. Forgetting still writes a tombstone, so automatic extraction cannot put that id or the same text back. The model never deletes files itself and never rewrites `MEMORY.md`.
 
 Nothing is written when the feature is disabled, in ephemeral sessions, when the turn errored or was aborted, when the run already wrote memory itself, when no substantive user text arrived, or when messages are still queued.
 
@@ -239,7 +251,7 @@ Claude Code and Codex both keep memory as files, but they disagree about who wri
 | Search | local BM25 + optional model pass | grep | literal line matching |
 | Who writes | model (files or tool), or background extraction | model (files), or background extraction sub-agent | only the background pipeline; the model gets one note-file escape hatch |
 | Extraction | opt-in; one call, or a ≤6-turn scoped sub-agent; cadence and idle flush | background fork with restricted tools, 4–5 turns | two-phase pipeline with leases and a git-baseline diff |
-| Consolidation | none | auto-dream | Phase 2 consolidation agent |
+| Consolidation | opt-in dream: one JSON plan, tombstones, 24h and 5 other sessions | auto-dream, forked sub-agent, server-gated | Phase 2 consolidation agent |
 | Team or cloud sync | none | personal/team/org stores with server sync | none |
 | Write guarantees | atomic per file, journal, cross-process lock | plain file writes | SQLite plus git baseline |
 | Forget | `/pmem forget` with a tombstone | delete the file | not exposed |
@@ -249,7 +261,7 @@ What is deliberately different:
 - **Model writes are allowed.** Codex keeps the model out of memory; this plugin treats notes as files the model may edit, like Claude Code, because a correction is usually cheapest to apply immediately.
 - **No team sync.** Notes stay on this machine; there is no server component to trust or configure.
 - **Search is local and ranked.** Claude Code relies on grep and Codex on literal matching; BM25 costs nothing and returns ranked snippets, with an optional model pass for paraphrases.
-- **No consolidation yet.** Duplicate suppression is exact-content based, so notes that say the same thing in different words survive until you merge them.
+- **Dreaming is a second pass, and it is off.** Extraction still records what this turn taught. Dream, when you opt in, merges near-duplicates and drops contradicted notes across earlier sessions. It is one bounded model call with a validated plan, not a shell-capable sub-agent, and it will not restore a forgotten id.
 
 ## Update and uninstall
 
@@ -273,7 +285,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 
 ## Limitations
 
-- No consolidation pass, no team or cloud sync, no per-subagent store.
+- No team or cloud sync, no per-subagent store. Dream reviews at most eight recent sessions and the newest notes that fit in a 30KB prompt, and it writes or forgets at most eight notes per pass.
 - `forget` is not privacy-grade erasure.
 - Fork-mode writes are applied file by file at the end, so a crash during that short window can still leave a subset written.
 - Developed and tested on macOS with Pi 1.2.0; Linux and Windows are unverified, as is power-loss durability.

@@ -4,13 +4,14 @@ import { lstat, realpath, rename } from "node:fs/promises";
 import { promisify } from "node:util";
 import { MemoryFiles, type Change, type FileText } from "./files.ts";
 import { parseTopic, renderIndex, renderTopic } from "./markdown.ts";
-import { clip, fingerprint, hash, legacyState, MAX_FORGOTTEN, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
+import { clip, fingerprint, hash, legacyState, MAX_DREAM_FORGETS, MAX_DREAM_WRITES, MAX_FORGOTTEN, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
 export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInput } from "./model.ts";
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
 
 interface Metadata { hash: string; contentHash: string; source: Source; createdAt: string; updatedAt: string }
-interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string }
+interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string; dreamedAt?: string; dreamFailedAt?: string }
 interface Loaded { state: State; disk: DiskState; metadata: FileText | null; index: FileText | null; documents: Map<string, FileText> }
+interface DreamClock { dreamedAt?: string | null; dreamFailedAt?: string | null }
 const emptyDisk = (): DiskState => ({ version: 2, revision: 0, records: {}, forgotten: [], indexHash: hash("") });
 const emptyState = (): State => ({ version: 2, revision: 0, notes: [], forgotten: [], index: renderIndex(null, []) });
 const noteMetadata = (note: Memory, digest: string): Metadata => ({ hash: digest, contentHash: fingerprint(note.content), source: note.source, createdAt: note.createdAt, updatedAt: note.updatedAt });
@@ -25,7 +26,9 @@ function validateDisk(value: unknown): DiskState {
     if (!validId(id) || typeof entry.hash !== "string" || !/^[a-f0-9]{64}$/.test(entry.hash) || typeof entry.contentHash !== "string" || !/^sha:[a-f0-9]{64}$/.test(entry.contentHash)) throw new Error("Invalid memory metadata");
     return [id, { hash: entry.hash, contentHash: entry.contentHash, source: validateSource(entry.source), createdAt: timestamp(entry.createdAt), updatedAt: timestamp(entry.updatedAt) }];
   }));
-  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash };
+  const dreamedAt = disk.dreamedAt === undefined ? undefined : timestamp(disk.dreamedAt);
+  const dreamFailedAt = disk.dreamFailedAt === undefined ? undefined : timestamp(disk.dreamFailedAt);
+  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash, ...(dreamedAt ? { dreamedAt } : {}), ...(dreamFailedAt ? { dreamFailedAt } : {}) };
 }
 
 export interface ProjectIdentity { key: string; name: string }
@@ -86,7 +89,7 @@ export class MemoryStore {
     this.files = new MemoryFiles(this.dir);
   }
 
-  private async persist(loaded: Loaded, notes: Memory[], forgotten: string[], edits: Map<string, string | null>, extras: Change[] = [], signal?: AbortSignal) {
+  private async persist(loaded: Loaded, notes: Memory[], forgotten: string[], edits: Map<string, string | null>, extras: Change[] = [], signal?: AbortSignal, clock?: DreamClock) {
     if (notes.length > MAX_NOTES) throw new Error("Memory limit reached; review /pmem list and forget obsolete notes");
     const index = renderIndex(loaded.index?.text ?? null, notes);
     const records = Object.fromEntries([...notes].sort((a, b) => a.id.localeCompare(b.id)).map(note => {
@@ -95,7 +98,10 @@ export class MemoryStore {
       if (body === undefined || body === null) throw new Error("Missing Markdown for memory metadata");
       return [note.id, noteMetadata(note, hash(body))];
     }));
-    const disk = validateDisk({ version: 2, revision: loaded.disk.revision + 1, records, forgotten: forgotten.slice(-MAX_FORGOTTEN), indexHash: hash(index) });
+    // Absent clock keeps the previous stamp. An explicit null clears one, which is how a success drops dreamFailedAt.
+    const dreamedAt = clock && "dreamedAt" in clock ? clock.dreamedAt ?? undefined : loaded.disk.dreamedAt;
+    const dreamFailedAt = clock && "dreamFailedAt" in clock ? clock.dreamFailedAt ?? undefined : loaded.disk.dreamFailedAt;
+    const disk = validateDisk({ version: 2, revision: loaded.disk.revision + 1, records, forgotten: forgotten.slice(-MAX_FORGOTTEN), indexHash: hash(index), ...(dreamedAt ? { dreamedAt } : {}), ...(dreamFailedAt ? { dreamFailedAt } : {}) });
     const changes: Change[] = [...edits].map(([name, after]) => ({ name, before: loaded.documents.get(name)?.hash ?? null, after }));
     changes.push(...extras);
     if (index !== loaded.index?.text) changes.push({ name: "MEMORY.md", before: loaded.index?.hash ?? null, after: index });
@@ -136,7 +142,7 @@ export class MemoryStore {
     }
     for (const [id, prior] of Object.entries(disk.records)) if (!documents.has(`${id}.md`) && !invalid.some(item => item.file === `${id}.md`)) forgotten.push(id, prior.contentHash);
     forgotten = [...new Set(forgotten)].slice(-MAX_FORGOTTEN);
-    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: renderIndex(index?.text ?? null, notes), ...(invalid.length ? { invalid } : {}) };
+    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: renderIndex(index?.text ?? null, notes), ...(invalid.length ? { invalid } : {}), ...(disk.dreamedAt ? { dreamedAt: disk.dreamedAt } : {}), ...(disk.dreamFailedAt ? { dreamFailedAt: disk.dreamFailedAt } : {}) };
     const loaded: Loaded = { state, disk, metadata, index, documents };
     if (invalid.length) return loaded;
     if (legacy) {
@@ -219,5 +225,62 @@ export class MemoryStore {
       const forgotten = [...new Set([...loaded.state.forgotten, id, fingerprint(note.content)])];
       await this.persist(loaded, loaded.state.notes.filter(note => note.id !== id), forgotten, new Map([[`${id}.md`, null]]));
     });
+  }
+
+  /**
+   * Apply one dream plan under the store lock: updates and additions, then tombstones.
+   * A note deleted in this same plan can still donate its text to a survivor; older tombstones cannot.
+   * dreamedAt advances even when every write is a no-op, so a clean store does not dream again immediately.
+   */
+  async consolidate(drafts: Draft[], forgetIds: string[], options: { expectedRevision: number; signal?: AbortSignal }): Promise<{ saved: string[]; forgotten: string[] }> {
+    if (drafts.length > MAX_DREAM_WRITES) throw new Error("At most eight dream writes");
+    if (forgetIds.length > MAX_DREAM_FORGETS) throw new Error("At most eight dream deletions");
+    if (new Set(forgetIds).size !== forgetIds.length) throw new Error("Duplicate dream forget ids");
+    const validated = drafts.map(draft => ({ ...validateInput(draft), source: validateSource(draft.source) }));
+    if (new Set(validated.map(draft => draft.id)).size !== validated.length) throw new Error("Duplicate dream write ids");
+    const dropping = new Set(forgetIds);
+    if (validated.some(draft => dropping.has(draft.id))) throw new Error("Dream cannot update and forget the same note");
+    await this.adoptLegacyDir();
+    return this.files.locked(async () => {
+      const loaded = await this.load();
+      if (loaded.state.invalid?.length) throw new Error("Memory store has invalid topic files");
+      if (loaded.state.revision !== options.expectedRevision) throw new Error("Memory changed during dreaming; stale result discarded");
+      for (const id of forgetIds) if (!validId(id) || !loaded.state.notes.some(note => note.id === id)) throw new Error("Dream forget id is not a current note");
+      const priorForgotten = new Set(loaded.state.forgotten);
+      let notes = loaded.state.notes.filter(note => !dropping.has(note.id));
+      const edits = new Map<string, string | null>(forgetIds.map(id => [`${id}.md`, null]));
+      const saved: string[] = [];
+      for (const input of validated) {
+        const digest = fingerprint(input.content);
+        if (priorForgotten.has(input.id) || priorForgotten.has(digest)) continue;
+        const existing = notes.find(note => note.id === input.id);
+        if (!existing && notes.some(note => fingerprint(note.content) === digest)) continue;
+        const description = input.description ?? existing?.description;
+        if (existing && existing.content === input.content && existing.title === input.title && existing.type === input.type && existing.description === description) continue;
+        const now = new Date().toISOString();
+        const note: Memory = { ...input, ...(description === undefined ? {} : { description }), id: existing?.id ?? input.id, createdAt: existing?.createdAt ?? now, updatedAt: now };
+        if (existing) notes[notes.indexOf(existing)] = note;
+        else {
+          if (notes.length >= MAX_NOTES) throw new Error("Memory limit reached; review /pmem list and forget obsolete notes");
+          notes.push(note);
+        }
+        edits.set(`${note.id}.md`, renderTopic(note));
+        saved.push(note.id);
+      }
+      const dropped = loaded.state.notes.filter(note => dropping.has(note.id));
+      const forgotten = [...new Set([...loaded.state.forgotten, ...dropped.flatMap(note => [note.id, fingerprint(note.content)])])];
+      await this.persist(loaded, notes, forgotten, edits, [], options.signal, { dreamedAt: new Date().toISOString(), dreamFailedAt: null });
+      return { saved, forgotten: forgetIds };
+    }, options.signal);
+  }
+
+  /** Back off automatic dreaming after a model failure without touching topic files. A stale store is left alone. */
+  async recordDreamFailure(options: { expectedRevision: number; signal?: AbortSignal } = { expectedRevision: -1 }): Promise<void> {
+    await this.adoptLegacyDir();
+    await this.files.locked(async () => {
+      const loaded = await this.load();
+      if (loaded.state.invalid?.length || loaded.state.revision !== options.expectedRevision) return;
+      await this.persist(loaded, loaded.state.notes, loaded.state.forgotten, new Map(), [], options.signal, { dreamFailedAt: new Date().toISOString() });
+    }, options.signal);
   }
 }

@@ -47,6 +47,7 @@ src/model.ts            types, validation, redaction, limits
 src/search.ts           BM25 and tokenisation
 src/intelligence.ts     model calls, extraction prompt and validation
 src/fork-extraction.ts  scoped tools and the bounded sub-agent loop
+src/dream.ts            consolidation plan, session evidence, dream gates
 sandbox-guard.ts        lab-only file-tool restriction
 tests/, e2e/            suites described above
 ```

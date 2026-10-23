@@ -11,14 +11,14 @@ import {
 import { MemoryStore, projectIdentity } from "../src/store.ts";
 import { createMemorySandboxGuard } from "../sandbox-guard.ts";
 
-export interface Request { kind: "main" | "extract" | "semantic"; model: string; context: TranscriptContext; options?: SimpleStreamOptions; data?: any }
+export interface Request { kind: "main" | "extract" | "semantic" | "dream"; model: string; context: TranscriptContext; options?: SimpleStreamOptions; data?: any }
 export type Reply = string | ToolCall | { stopReason: "error" | "aborted"; text: string };
 const usage = () => ({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 export function syntheticStream(model: Model<string>, context: TranscriptContext, options: SimpleStreamOptions | undefined, answer: (request: Request) => Reply | Promise<Reply>, requests: Request[]) {
   const stream = createAssistantMessageEventStream();
   queueMicrotask(async () => {
     const prompt = getCurrentSystemPrompt(context.messages);
-    const kind = prompt.startsWith("Extract at most") ? "extract" : prompt.startsWith("Select up to 5 memory ids") ? "semantic" : "main";
+    const kind = prompt.startsWith("Extract at most") ? "extract" : prompt.startsWith("Select up to 5 memory ids") ? "semantic" : prompt.startsWith("Consolidate this project's") ? "dream" : "main";
     const last = context.messages.findLast(message => message.role === "user");
     const text = last ? typeof last.content === "string" ? last.content : last.content.filter(part => part.type === "text").map(part => part.text).join("\n") : "";
     const request: Request = { kind, model: model.id, context, options, ...(kind !== "main" ? { data: JSON.parse(text) } : {}) };
