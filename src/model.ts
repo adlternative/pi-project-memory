@@ -5,9 +5,12 @@ export type MemoryType = (typeof TYPES)[number];
 export interface MemoryInput { id: string; type: MemoryType; title: string; description?: string; content: string }
 export interface Source { sessionId: string; entryId: string; quote: string; origin: "explicit" | "extracted" | "file" }
 export interface Memory extends MemoryInput { source: Source; createdAt: string; updatedAt: string }
-export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; invalid?: { file: string; error: string }[] }
+export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; invalid?: { file: string; error: string }[]; dreamedAt?: string; dreamFailedAt?: string }
 export interface Draft extends MemoryInput { source: Source }
 export const MAX_NOTES = 128;
+/** One consolidation pass may merge a handful of notes and drop a handful of duplicates. */
+export const MAX_DREAM_WRITES = 8;
+export const MAX_DREAM_FORGETS = 8;
 /** Tombstones roll over oldest-first; forgetting must never brick the store. */
 export const MAX_FORGOTTEN = 512;
 export const hash = (text: string) => createHash("sha256").update(text).digest("hex");

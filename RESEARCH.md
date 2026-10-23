@@ -97,3 +97,9 @@ A separate development harness now exercises the actual built-in `openai-codex/g
 - One retention limitation was observed: a surviving note's provenance quote can still contain an older deleted label. The functional cold recall correctly returned null, but this is not proof of privacy-grade erasure. No unrequested source-history rewriting was added to hide that finding.
 
 This is a single-model sample, not evidence of universal model reliability, cross-platform support or power-loss durability.
+
+## v0.9 bounded dream
+
+Claude Code's auto-dream is a forked sub-agent with read-only Bash plus direct edits and deletes inside the memory directory, gated by `tengu_onyx_plover`, and scheduled on lock-file mtime (default 24 hours and 5 other sessions). Official memory docs still do not describe it.
+
+This package does not port that agent. Extraction remains the per-turn path. Dream is a separate opt-in pass (`autoDream`, `/pmem dream`) that reads redacted user and assistant prose from earlier session files, asks for one JSON plan, and applies it through the existing lock: updates keep their ids, deletions go through tombstones, and `MEMORY.md` stays generated. A failure stamps `dreamFailedAt` and backs off; it does not roll the notes backward. The model has no shell and cannot delete a file except by naming an id the store then forgets.

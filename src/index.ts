@@ -8,6 +8,7 @@ import { search } from "./search.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
 import { applyStaged, runForkExtraction } from "./fork-extraction.ts";
+import { conversationLines, DREAM_PROMPT, executeDream, type DreamReport } from "./dream.ts";
 
 const MemorySchema = Type.Object({
   id: Type.String(), type: Type.Union(TYPES.map(type => Type.Literal(type))),
@@ -40,6 +41,7 @@ function result(memory: MemoryStore, notes: Memory[], truncated = false, nextOff
 export interface MemorySettings {
   enabled: boolean; directory?: string; autoExtract: boolean; extractModel: string; dedicatedTools: boolean;
   everyNTurns: number; idleFlushSeconds: number; extractionMode: "call" | "fork";
+  autoDream: boolean; dreamMinHours: number; dreamMinSessions: number; dreamRetryHours: number;
 }
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
 
@@ -57,6 +59,10 @@ function readSettings(pi: ExtensionAPI): MemorySettings {
     everyNTurns: Math.round(number(value.everyNTurns, 5, 1, 100)),
     idleFlushSeconds: number(value.idleFlushSeconds, 120, 0, 86_400),
     extractionMode: value.extractionMode === "fork" ? "fork" : "call",
+    autoDream: value.autoDream === true,
+    dreamMinHours: number(value.dreamMinHours, 24, 0, 24 * 365),
+    dreamMinSessions: Math.round(number(value.dreamMinSessions, 5, 0, 100)),
+    dreamRetryHours: number(value.dreamRetryHours, 1, 0, 24 * 14),
   };
 }
 
@@ -70,10 +76,12 @@ function expandDirectory(directory: string): string {
 export default function projectMemory(pi: ExtensionAPI) {
   pi.registerFlag("memory-dir", { type: "string", description: "Override projectMemory.directory for this run" });
   pi.registerFlag("memory-auto", { type: "boolean", description: "Override projectMemory.autoExtract for this run" });
+  pi.registerFlag("memory-dream", { type: "boolean", description: "Override projectMemory.autoDream for this run" });
   pi.registerFlag("memory-disabled", { type: "boolean", default: false, description: "Disable memory for this process, overriding projectMemory.enabled" });
   let store: MemoryStore | undefined;
   let workspace = "";
   let auto = false;
+  let dream = false;
   let epoch = 0;
   let lifecycle: AbortController | undefined;
   const jobs = new Set<Promise<void>>();
@@ -194,6 +202,66 @@ export default function projectMemory(pi: ExtensionAPI) {
     jobs.add(job);
   }
 
+  function sessionIsPersisted(ctx: ExtensionContext): boolean {
+    const manager = ctx.sessionManager as ExtensionContext["sessionManager"] & { isPersisted?: () => boolean };
+    return typeof manager.isPersisted === "function" ? manager.isPersisted() && manager.getSessionDir() !== "" : !!manager.getSessionFile();
+  }
+
+  /** A second, rarer pass: merge and tombstone across sessions. It never shares extraction's 20s budget. */
+  function startDream(ctx: ExtensionContext, trigger: "auto" | "manual", extra?: AbortSignal): Promise<DreamReport | undefined> {
+    if (!lifecycle) return Promise.resolve(undefined);
+    if (jobs.size) {
+      if (trigger === "manual") throw new Error("Memory maintenance is already running");
+      return Promise.resolve(undefined);
+    }
+    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(45_000), ...(extra ? [extra] : [])]);
+    const work = dreamAndSave(ctx, signal, trigger);
+    const job: Promise<void> = work.then(() => undefined, () => undefined).finally(() => {
+      jobs.delete(job);
+      if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
+    });
+    jobs.add(job);
+    return work;
+  }
+
+  async function dreamAndSave(ctx: ExtensionContext, signal: AbortSignal, trigger: "auto" | "manual"): Promise<DreamReport | undefined> {
+    try {
+      if (!enabled() || !sessionIsPersisted(ctx) || signal.aborted) return;
+      const memory = await getStore(ctx);
+      const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
+      if (!snapshot || snapshot.invalid) {
+        const result: DreamReport = { status: "failed", reason: snapshot?.invalid ? "invalid_store" : "unreadable_store" };
+        pi.appendEntry("pi-project-memory.dream", { ...result, trigger });
+        return result;
+      }
+      const settings = readSettings(pi);
+      const { model, requested } = extractionModel(ctx);
+      const result = await executeDream({
+        signal, trigger, now: Date.now(),
+        settings, snapshot, cwd: ctx.cwd, sessionDir: ctx.sessionManager.getSessionDir(), sessionId: ctx.sessionManager.getSessionId(),
+        currentLines: conversationLines(ctx.sessionManager.buildSessionProjection().entries, ctx.sessionManager.getSessionId()),
+        callModel: async data => {
+          const answer = await modelJSON(ctx, model, DREAM_PROMPT, data, signal);
+          return { data: answer.data, provider: answer.response.provider, model: answer.response.model, usage: answer.response.usage, ...(requested ? { requestedModel: requested } : {}) };
+        },
+        consolidate: (drafts, forget, expectedRevision) => memory.consolidate(drafts, forget, { expectedRevision, signal }),
+        recordFailure: expectedRevision => memory.recordDreamFailure({ expectedRevision, signal }),
+      });
+      if (signal.aborted || result.reason === "aborted") return result;
+      // Gate misses happen on ordinary session starts. Keep those out of the transcript; manual runs and real passes are recorded.
+      if (trigger === "auto" && result.status === "skipped") return result;
+      pi.appendEntry("pi-project-memory.dream", { status: result.status, trigger, ...(result.reason ? { reason: result.reason } : {}), ...(result.saved ? { saved: result.saved } : {}), ...(result.forgotten ? { forgotten: result.forgotten } : {}), ...(result.provider ? { provider: result.provider, model: result.model } : {}), ...(result.requestedModel ? { requestedModel: result.requestedModel } : {}), ...(result.usage ? { usage: result.usage } : {}) });
+      if (ctx.hasUI && result.status === "ok" && ((result.saved?.length ?? 0) || (result.forgotten?.length ?? 0))) ctx.ui.notify(`Project memory: updated ${result.saved?.length ?? 0}, forgot ${result.forgotten?.length ?? 0}`, "info");
+      if (ctx.hasUI && result.status === "failed") ctx.ui.notify("Project memory dream failed; notes unchanged.", "warning");
+      return result;
+    } catch (error) {
+      if (signal.aborted) return;
+      const result: DreamReport = { status: "failed", reason: clip(error instanceof Error ? error.message : String(error), 300) };
+      pi.appendEntry("pi-project-memory.dream", { ...result, trigger });
+      return result;
+    }
+  }
+
   function armIdleFlush(ctx: ExtensionContext) {
     clearIdle();
     const seconds = readSettings(pi).idleFlushSeconds;
@@ -232,12 +300,15 @@ export default function projectMemory(pi: ExtensionAPI) {
     catch { return { isError: true, content: [{ type: "text", text: "The Markdown edit is on disk but memory ingestion failed. Fix its flat frontmatter/content/size or resolve the store conflict. The edit was not silently rolled back." }] }; }
   });
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
     epoch++; clearIdle(); lifecycle?.abort(); lifecycle = new AbortController(); store = undefined; run = undefined; turnsSinceExtract = 0; trailing = false;
     const flag = pi.getFlag("memory-auto");
     auto = typeof flag === "boolean" ? flag : readSettings(pi).autoExtract;
+    const dreamFlag = pi.getFlag("memory-dream");
+    dream = typeof dreamFlag === "boolean" ? dreamFlag : readSettings(pi).autoDream;
     // Default parity with Claude Code and Codex: the memory directory is the interface, so tools are opt-in.
     if (!readSettings(pi).dedicatedTools) pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("pmem_")));
+    if (dream && enabled()) void startDream(ctx, "auto");
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     epoch++; run = undefined; store = undefined;
@@ -334,7 +405,7 @@ export default function projectMemory(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("pmem", {
-    description: "Project memory: status | list [offset] | show <id> | forget <id> | auto on/off | extract",
+    description: "Project memory: status | list [offset] | show <id> | forget <id> | auto on/off | extract | dream [on|off]",
     handler: async (args, ctx) => {
       const [action = "status", value] = args.trim().split(/\s+/);
       if (action === "auto") {
@@ -349,6 +420,22 @@ export default function projectMemory(pi: ExtensionAPI) {
         await extractAndSave(ctx, AbortSignal.any([AbortSignal.timeout(30_000), ...(ctx.signal ? [ctx.signal] : [])]), ctx.sessionManager.getLeafId() ?? null, "manual");
         report("Memory extraction attempted; /pmem list shows stored notes. Usage/status is recorded as pi-project-memory.extraction entries."); return;
       }
+      if (action === "dream") {
+        if (value === "on" || value === "off") {
+          if (!enabled()) throw new Error("Use /pmem dream on|off in an enabled session");
+          dream = value === "on";
+          report(`Automatic memory dreaming ${dream ? "on (extra model call; persistent sessions only)" : "off"} for this session.`);
+          return;
+        }
+        if (value) throw new Error("Use /pmem dream, or /pmem dream on|off");
+        if (!enabled() || !sessionIsPersisted(ctx)) throw new Error("Dreaming requires an enabled, persistent session");
+        const result = await startDream(ctx, "manual", ctx.signal);
+        if (!result || result.reason === "aborted") report("Dream did not finish.");
+        else if (result.status === "skipped" && result.reason === "no_notes") report("No notes to consolidate.");
+        else if (result.status === "ok") report(`Dream finished. Updated ${(result.saved ?? []).join(", ") || "nothing"}; forgot ${(result.forgotten ?? []).join(", ") || "nothing"}.`);
+        else report(`Dream ${result.status}${result.reason ? `: ${result.reason}` : ""}.`);
+        return;
+      }
       const memory = await getStore(ctx);
       if (action === "forget") {
         epoch++;
@@ -358,14 +445,14 @@ export default function projectMemory(pi: ExtensionAPI) {
         return;
       }
       const state = await memory.read({ tolerant: true });
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, dreamMinHours: readSettings(pi).dreamMinHours, dreamMinSessions: readSettings(pi).dreamMinSessions, ...(state.dreamedAt ? { dreamedAt: state.dreamedAt } : {}), ...(state.dreamFailedAt ? { dreamFailedAt: state.dreamFailedAt } : {}), ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, dream, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");
         report({ notes: state.notes.slice(offset, offset + 10).map(({ id, type, title }) => ({ id, type, title })), nextOffset: offset + 10 < state.notes.length ? offset + 10 : null }); return;
       }
       if (action === "show") { const note = state.notes.find(note => note.id === value); if (!note) throw new Error("Memory not found"); report(note); return; }
-      report("Use /pmem status | list [offset] | show <id> | forget <id> | auto on/off | extract");
+      report("Use /pmem status | list [offset] | show <id> | forget <id> | auto on/off | extract | dream [on|off]");
     },
   });
 }
