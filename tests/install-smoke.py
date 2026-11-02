@@ -74,7 +74,10 @@ topic = stores[0].parent / 'package-manager.md'
 assert 'Use pnpm, not npm' in topic.read_text(), topic.read_text()
 assert '(package-manager.md)' in (stores[0].parent / 'MEMORY.md').read_text()
 assert 'Use pnpm [pmem:package-manager].' in outputs[1], outputs[1][-800:]
-assert [json.loads(line)['kind'] for line in trace.read_text().splitlines()] == ['main', 'extract', 'main']
+# Extraction is on by default now, so the recall run may extract again after its main turn.
+kinds = [json.loads(line)['kind'] for line in trace.read_text().splitlines()]
+assert kinds[:3] == ['main', 'extract', 'main'], kinds
+assert all(kind == 'extract' for kind in kinds[3:]), kinds
 
 subprocess.run([pi, 'remove', source], env=env, check=True, capture_output=True, text=True, timeout=120)
 assert source not in json.loads((agent / 'settings.json').read_text()).get('packages', [])
