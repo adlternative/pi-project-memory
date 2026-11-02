@@ -111,7 +111,10 @@ test("by default there are no memory tools, and a plain Markdown file is the int
   // Without overrides the plugin resolves its base from the process agent dir, not the harness option.
   const dir = join(getAgentDir(), "project-memory", `${identity.name}__${identity.key.slice(0, 12)}`);
   t.after(() => rm(dir, { recursive: true, force: true }));
-  assert.equal(JSON.parse(String(injected.content)).directory, dir);
+  const payload = JSON.parse(String(injected.content));
+  assert.equal(payload.directory, dir);
+  // Files-only sessions must not advertise a tool they do not have.
+  assert.equal(String(payload.notice).includes("pmem_"), false);
 
   // Writing the topic file by hand is enough: the plugin ingests it into the index.
   await mkdir(dir, { recursive: true, mode: 0o700 });
