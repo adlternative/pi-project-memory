@@ -165,3 +165,17 @@ test("idle flush runs a pass after the turn settles, without waiting for the cad
   assert.ok(entry && entry.type === "custom");
   assert.equal((entry.data as { trigger?: string }).trigger, "idle");
 });
+
+test("settings defaults: extraction is on, tools are off, cadence is Claude Code's", async () => {
+  const { parseMemorySettings } = await import("../src/index.ts");
+  const defaults = parseMemorySettings(undefined);
+  assert.equal(defaults.autoExtract, true);
+  assert.equal(defaults.enabled, true);
+  assert.equal(defaults.dedicatedTools, false);
+  assert.equal(defaults.everyNTurns, 5);
+  assert.equal(defaults.idleFlushSeconds, 120);
+  assert.equal(defaults.extractModel, "qoder/fast");
+  assert.equal(defaults.extractionMode, "call");
+  assert.equal(parseMemorySettings({ autoExtract: false }).autoExtract, false);
+  assert.equal(parseMemorySettings({ everyNTurns: 0 }).everyNTurns, 1);
+});

@@ -76,7 +76,8 @@ export async function makeHarness(t: { after(fn: () => Promise<void>): void }, o
   // Tool-driven tests opt in; the default configuration exposes no memory tools, like CC.
   const supplied = (options.settings?.projectMemory ?? {}) as Record<string, unknown>;
   // Tests want one extraction per prompt; production defaults to every 5 turns plus idle flush.
-  const projectMemory = { dedicatedTools: options.dedicatedTools ?? true, everyNTurns: 1, idleFlushSeconds: 0, ...supplied };
+  // Product default is autoExtract true; suites opt out unless they ask for extraction.
+  const projectMemory = { dedicatedTools: options.dedicatedTools ?? true, everyNTurns: 1, idleFlushSeconds: 0, autoExtract: options.auto ?? false, ...supplied };
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off", defaultProjectTrust: "never", enableInstallTelemetry: false, ...options.settings, projectMemory } as never);
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, additionalExtensionPaths: [resolve("src/index.ts")], extensionFactories: options.fileTools ? [createMemorySandboxGuard(memoryDir)] : [], noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
   await loader.reload();

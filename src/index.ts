@@ -45,20 +45,23 @@ export interface MemorySettings {
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
 
 /** Configuration lives in Pi settings so it survives installs, like CC's autoMemory* keys. */
-function readSettings(pi: ExtensionAPI): MemorySettings {
-  const section = (pi.getSettings() as unknown as Record<string, unknown>).projectMemory;
+export function parseMemorySettings(section: unknown): MemorySettings {
   const value = typeof section === "object" && section !== null ? section as Record<string, unknown> : {};
   const directory = typeof value.directory === "string" && value.directory.trim() ? value.directory.trim() : undefined;
   const extractModel = typeof value.extractModel === "string" && value.extractModel.trim() ? value.extractModel.trim() : DEFAULT_EXTRACT_MODEL;
   const number = (input: unknown, fallback: number, min: number, max: number) =>
     typeof input === "number" && Number.isFinite(input) ? Math.min(max, Math.max(min, input)) : fallback;
   return {
-    enabled: value.enabled !== false, directory, autoExtract: value.autoExtract === true, extractModel,
+    enabled: value.enabled !== false, directory, autoExtract: value.autoExtract !== false, extractModel,
     dedicatedTools: value.dedicatedTools === true,
     everyNTurns: Math.round(number(value.everyNTurns, 5, 1, 100)),
     idleFlushSeconds: number(value.idleFlushSeconds, 120, 0, 86_400),
     extractionMode: value.extractionMode === "fork" ? "fork" : "call",
   };
+}
+
+function readSettings(pi: ExtensionAPI): MemorySettings {
+  return parseMemorySettings((pi.getSettings() as unknown as Record<string, unknown>).projectMemory);
 }
 
 function expandDirectory(directory: string): string {

@@ -134,7 +134,7 @@ Configure memory in Pi settings so it survives installs. Use user scope (`~/.pi/
   "projectMemory": {
     "enabled": true,
     "directory": "~/pi-memory",
-    "autoExtract": false,
+    "autoExtract": true,
     "extractModel": "qoder/fast",
     "dedicatedTools": false,
     "everyNTurns": 5,
@@ -148,7 +148,7 @@ Configure memory in Pi settings so it survives installs. Use user scope (`~/.pi/
 |---|---|---|
 | `enabled` | `true` | Master switch; `false` stops recall, writes and extraction without deleting notes |
 | `directory` | `<agent-dir>/project-memory` | Base directory for all project stores; absolute or starting with `~/` |
-| `autoExtract` | `false` | Opt in to background extraction |
+| `autoExtract` | `true` | Background extraction runs by default; set `false` to opt out |
 | `extractModel` | `qoder/fast` | Model for extraction, as `provider/model` or a bare id; falls back to the session model and records `requestedModel` |
 | `dedicatedTools` | `false` | Expose `pmem_list`/`pmem_read`/`pmem_search`/`pmem_save`; off means files are the interface |
 | `everyNTurns` | `5` | Run one extraction pass every N user prompts |
@@ -191,7 +191,7 @@ Five paths can write:
 
 1. The model edits a topic file with `write`/`edit`; the extension ingests it immediately and refreshes the index.
 2. The model calls `pmem_save` (when `dedicatedTools` is on).
-3. Background extraction, when `autoExtract` is on: every `everyNTurns` prompts, after `idleFlushSeconds` of inactivity, or once as a trailing pass if a pass was already running.
+3. Background extraction (on by default): every `everyNTurns` prompts, after `idleFlushSeconds` of inactivity, or once as a trailing pass if a pass was already running.
 4. `/pmem extract`.
 5. `/pmem forget` removes a note.
 
@@ -220,7 +220,7 @@ Background extraction runs detached, so the turn settles immediately. Only one p
 ## Safety
 
 - **Not secure erasure.** `/pmem forget` deletes the topic and blocks automatic restoration of that id or identical content. It does not erase Pi sessions, migration backups, or provenance quotes stored in other notes.
-- **Memory is untrusted input.** Notes are data, not instructions, and current instructions win; a note can still influence later sessions, so keep automatic extraction off for sensitive work.
+- **Memory is untrusted input.** Notes are data, not instructions, and current instructions win; a note can still influence later sessions, so set `"autoExtract": false` for sensitive work.
 - Known credential shapes are redacted before extraction and rejected on save; this is not DLP.
 - Writes use an in-process queue plus a cross-process lock, replace each file atomically, and journal multi-file updates with `.state.json` committed last. A crash-left `.lock` deliberately blocks access until you remove it.
 - Path traversal, symlinks, hardlinked data files, invalid UTF-8 and unknown state are rejected. New files are `0600`, directories `0700`.
@@ -269,7 +269,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 
 **Writes stop with a busy or conflict error.** Another Pi process holds the lock, or an external edit conflicted with a pending transaction. Close other sessions, inspect `.pending.json` and the affected topic, and keep the newer manual edit.
 
-**Memory did not update after a prompt.** Background extraction is off by default, and when on it runs once per `everyNTurns` prompts or after an idle period. Run `/pmem extract` to force a pass.
+**Memory did not update after a prompt.** Background extraction runs once per `everyNTurns` prompts (default 5) or after an idle period, and only saves what is durable. Run `/pmem extract` to force a pass.
 
 ## Limitations
 
