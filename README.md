@@ -153,7 +153,7 @@ Configure memory in Pi settings so it survives installs. Use user scope (`~/.pi/
 | `dedicatedTools` | `false` | Expose `pmem_list`/`pmem_read`/`pmem_search`/`pmem_save`; off means files are the interface |
 | `everyNTurns` | `5` | Run one extraction pass every N user prompts |
 | `idleFlushSeconds` | `120` | Also run a pass after this much inactivity; `0` disables it |
-| `extractionMode` | `"call"` | `"call"` sends one no-tool JSON request; `"fork"` runs a bounded sub-agent with two memory-only tools |
+| `extractionMode` | `"call"` | `"call"` sends a no-tool JSON request with at most one retry for invalid evidence; `"fork"` runs a bounded sub-agent with two memory-only tools |
 
 Per-run overrides exist for experiments and automation; a flag affects only the process it is passed to. Precedence is flag, then settings, then default.
 
@@ -199,7 +199,7 @@ Nothing is written when the feature is disabled, in ephemeral sessions, when the
 
 Background extraction runs detached, so the turn settles immediately. Only one pass runs at a time; a pass is discarded when a newer turn has already started. Results are re-checked against the store revision before writing, and a shutdown first runs a pending idle pass, then drains in-flight work for up to 15 seconds.
 
-`call` mode makes one request and applies validated JSON. `fork` mode gives a sub-agent up to six turns with `read_memory` and `write_memory`, both confined to the current project's memory directory, then applies its staged files atomically. A cancelled or failed pass discards everything.
+`call` mode applies validated JSON and retries once if the model's evidence reference or verbatim quote is invalid, within the same time budget. Its `qoder/fast` requests explicitly disable reasoning because the gateway can otherwise spend the entire output budget on hidden reasoning. `fork` mode gives a sub-agent up to six turns with `read_memory` and `write_memory`, both confined to the current project's memory directory, then applies its staged files atomically. A cancelled or failed pass discards everything.
 
 ## Retrieval and limits
 
@@ -214,8 +214,8 @@ Background extraction runs detached, so the turn settles immediately. Only one p
 | Topic file including frontmatter | 4,096 bytes |
 | MEMORY.md | 25,000 bytes |
 | Tool output | 12,000 bytes |
-| Nested model input / output | 32,000 bytes (trimmed to 30,000) / 16,000 bytes, 2,000 tokens |
-| Extraction budget | 20 s, 12 messages, 1,000 bytes each, at most 4 notes |
+| Nested model input / output | 32,000 bytes (trimmed to 30,000) / 16,000 text bytes; no memory-specific token cap, the model's own output limit applies |
+| Extraction budget | 60 s, 12 messages, 1,000 bytes each, at most 4 notes |
 
 ## Safety
 

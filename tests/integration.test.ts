@@ -108,7 +108,82 @@ test("invalid extraction fails closed without damaging a successful conversation
   const entries = extractionEntries(h);
   assert.equal(entries.length, 1);
   assert.equal(entries[0].type === "custom" && (entries[0].data as any).status, "failed");
+  assert.equal((entries[0].data as any).reason, "Invalid memory id or type (memory is reserved for MEMORY.md)");
   assert.deepEqual(h.errors, []);
+});
+
+test("ungrounded extraction retries once with feedback and accounts for both calls", async t => {
+  let attempts = 0;
+  const h = await makeHarness(t, { auto: false, answer: request => {
+    if (request.kind !== "extract") return "Done.";
+    attempts++;
+    const value = JSON.parse(extraction(request));
+    if (attempts === 1) value.memories[0].quote = "invented quotation";
+    return JSON.stringify(value);
+  } });
+  await h.session.prompt("Please prefer pnpm over npm for this project.");
+  await h.session.prompt("/pmem extract");
+  assert.equal(attempts, 2);
+  assert.equal((await h.store.read()).notes.length, 1);
+  const entry = extractionEntries(h)[0];
+  assert.equal((entry.data as any).status, "ok");
+  assert.equal((entry.data as any).usage.totalTokens, 30);
+  assert.ok(h.session.messages.some(message => message.role === "custom" && String(message.content).includes("completed; saved 1 note")));
+});
+
+test("repeated ungrounded evidence fails without saving and manual command reports failure", async t => {
+  let attempts = 0;
+  const h = await makeHarness(t, { answer: request => {
+    if (request.kind !== "extract") return "Done.";
+    attempts++;
+    const value = JSON.parse(extraction(request));
+    value.memories[0].entryId = "absent";
+    return JSON.stringify(value);
+  } });
+  await h.session.prompt("Please prefer pnpm over npm for this project.");
+  await h.session.prompt("/pmem extract");
+  assert.equal(attempts, 2);
+  assert.deepEqual((await h.store.read()).notes, []);
+  const entry = extractionEntries(h)[0];
+  assert.equal((entry.data as any).status, "failed");
+  assert.match((entry.data as any).reason, /entryId is not in the supplied evidence/);
+  assert.equal((entry.data as any).usage.totalTokens, 30);
+  assert.ok(h.session.messages.some(message => message.role === "custom" && String(message.content).includes("Memory extraction failed:")));
+  assert.deepEqual(h.errors, []);
+});
+
+test("failed model requests record provider error, stop reason and usage including an earlier grounding attempt", async t => {
+  for (const retry of [false, true]) {
+    let attempts = 0;
+    const secret = "sk-" + "f".repeat(32);
+    const h = await makeHarness(t, { answer: request => {
+      if (request.kind !== "extract") return "Done.";
+      attempts++;
+      if (retry && attempts === 1) {
+        const value = JSON.parse(extraction(request));
+        value.memories[0].quote = "invented quotation";
+        return JSON.stringify(value);
+      }
+      return { stopReason: "error", text: `HTTP 429: ${secret}` };
+    } });
+    await h.session.prompt("Please prefer pnpm over npm for this project.");
+    await h.session.prompt("/pmem extract");
+    const data = extractionEntries(h)[0].data as any;
+    assert.equal(data.status, "failed");
+    assert.equal(data.stopReason, "error");
+    assert.equal(data.provider, "memory-test");
+    assert.match(data.reason, /HTTP 429/);
+    assert.equal(data.reason.includes(secret), false);
+    assert.equal(data.usage.totalTokens, retry ? 30 : 15);
+    assert.deepEqual((await h.store.read()).notes, []);
+  }
+});
+
+test("manual extraction reports a skip when there is no user evidence", async t => {
+  const h = await makeHarness(t);
+  await h.session.prompt("/pmem extract");
+  assert.equal(h.requests.length, 0);
+  assert.ok(h.session.messages.some(message => message.role === "custom" && String(message.content).includes("skipped: no new user evidence")));
 });
 
 test("known credential values are removed before extraction; raw tool/system content is not supplied", async t => {
@@ -163,6 +238,7 @@ test("a concurrent edit during extraction rejects the stale model result", async
   assert.equal((await h.store.read()).notes[0].content, "Newer explicit choice: use bun.");
   assert.equal(extractionEntries(h).length, 1);
   assert.equal(extractionEntries(h)[0].type === "custom" && (extractionEntries(h)[0].data as any).status, "failed");
+  assert.equal((extractionEntries(h)[0].data as any).reason, "Memory changed during extraction; stale result discarded");
 });
 
 test("forget command suppresses old evidence, toggle is session-only, disabled mode never opens stores", async t => {

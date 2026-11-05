@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { MemoryStore, clip, hash, projectIdentity, projectKey, redact, type Draft, type Memory } from "../src/store.ts";
 import { search, tokenize } from "../src/search.ts";
-import { parseExtraction } from "../src/intelligence.ts";
+import { MemoryModelError, modelJSON, parseExtraction } from "../src/intelligence.ts";
 import { renderIndex } from "../src/markdown.ts";
 
 export const draft = (id = "package-manager", content = "Use pnpm, not npm, to install dependencies."): Draft => ({
@@ -235,6 +235,76 @@ test("extraction validates evidence, role, duplicate ids, secret text and unknow
     { ...memory, content: "token=" + "x".repeat(30) },
   ]) assert.throws(() => parseExtraction({ memories: [item] }, evidence, "session"));
   assert.throws(() => parseExtraction({ memories: [memory, memory] }, evidence, "session"));
+});
+
+test("memory JSON calls explicitly disable hidden qoder/fast reasoning without changing other models", async () => {
+  for (const [provider, id, api, disabled] of [
+    ["qoder", "fast", "openai-completions", true],
+    ["qoder", "ultimate", "openai-completions", false],
+    ["other", "fast", "openai-completions", false],
+    ["qoder", "fast", "anthropic-messages", false],
+  ] as const) {
+    const model = { provider, id, api, reasoning: false } as NonNullable<Parameters<typeof modelJSON>[1]>;
+    const ctx = { modelRegistry: { streamSimple: (_model: unknown, _context: unknown, options: {
+      reasoning?: string; onPayload?: (payload: unknown) => unknown;
+    }) => ({ result: async () => {
+      const payload = { model: id, max_completion_tokens: 8192, messages: [] };
+      const sent = (options.onPayload?.(payload) ?? payload) as Record<string, unknown>;
+      assert.equal(sent.reasoning_effort, disabled ? "none" : undefined);
+      assert.equal(options.reasoning, disabled ? undefined : "low");
+      assert.equal(model.reasoning, false, "the shared model configuration must stay unchanged");
+      assert.equal(sent.messages, payload.messages);
+      return { stopReason: "stop", content: [{ type: "text", text: '{"memories":[]}' }], usage: {} };
+    } }) } } as unknown as Parameters<typeof modelJSON>[0];
+    assert.deepEqual((await modelJSON(ctx, model, "Extract", {})).data, { memories: [] });
+  }
+});
+
+test("JSON calls use the model's own output budget and reject incomplete JSON", async () => {
+  const model = { provider: "memory-test", id: "synthetic" } as NonNullable<Parameters<typeof modelJSON>[1]>;
+  let truncated = false;
+  const usage = { input: 10, output: 2400, reasoning: 1999, cacheRead: 0, cacheWrite: 0, totalTokens: 2410, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const ctx = { modelRegistry: { streamSimple: (_model: unknown, _context: unknown, options: { maxTokens?: number }) => ({ result: async () => {
+    assert.equal(options.maxTokens, undefined, "no memory-specific output cap; the model's own limit applies");
+    return { stopReason: truncated ? "length" : "stop", content: [{ type: "text", text: truncated ? '{"memories":[' : '{"memories":[]}' }], usage };
+  } }) } } as unknown as Parameters<typeof modelJSON>[0];
+  const result = await modelJSON(ctx, model, "Extract", {});
+  assert.deepEqual(result.data, { memories: [] });
+  assert.equal(result.response.usage.reasoning, 1999);
+  truncated = true;
+  await assert.rejects(modelJSON(ctx, model, "Extract", {}), error => error instanceof MemoryModelError && error.response.stopReason === "length");
+});
+
+test("model failures preserve stop reason and usage without exposing credentials or raw JSON", async () => {
+  const model = { provider: "memory-test", id: "synthetic" } as NonNullable<Parameters<typeof modelJSON>[1]>;
+  const usage = { input: 10, output: 2000, cacheRead: 0, cacheWrite: 0, totalTokens: 2010, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const secret = "sk-" + "f".repeat(32);
+  for (const stopReason of ["length", "error", "aborted", "toolUse", "stop"] as const) {
+    const response = { stopReason, errorMessage: stopReason === "error" ? `HTTP 429 ${secret}` : undefined, content: [{ type: "text", text: "invalid JSON " + secret }], usage };
+    const ctx = { modelRegistry: { streamSimple: () => ({ result: async () => response }) } } as unknown as Parameters<typeof modelJSON>[0];
+    await assert.rejects(modelJSON(ctx, model, "Extract", {}), error => {
+      assert.ok(error instanceof MemoryModelError);
+      assert.equal(error.response, response);
+      assert.equal(error.response.usage.totalTokens, 2010);
+      assert.equal(error.message.includes(secret), false);
+      assert.match(error.message, stopReason === "stop" ? /invalid JSON/ : new RegExp(stopReason));
+      if (stopReason === "length") assert.match(error.message, /model output token limit reached/);
+      if (stopReason === "error") assert.match(error.message, /HTTP 429/);
+      return true;
+    });
+  }
+});
+
+test("extraction distinguishes invalid evidence references without relaxing exact matching", () => {
+  const evidence = [{ entryId: "u1", role: "user" as const, text: "请使用 pnpm。".repeat(30) }];
+  const memory = { id: "pnpm", type: "feedback", title: "Package manager", content: "Use pnpm.", entryId: "u1", quote: "请使用 pnpm。" };
+  assert.equal(parseExtraction({ memories: [memory] }, evidence, "session")[0].source.quote, memory.quote);
+  for (const [change, reason] of [
+    [{ entryId: "missing" }, /entryId is not in/],
+    [{ quote: "" }, /empty or missing/],
+    [{ quote: evidence[0].text }, /exceeds 400 UTF-8 bytes/],
+    [{ quote: "请使用pnpm。" }, /not an exact substring/],
+  ] as const) assert.throws(() => parseExtraction({ memories: [{ ...memory, ...change }] }, evidence, "session"), reason);
 });
 
 test("project folders are readable but the hash stays authoritative", async t => {

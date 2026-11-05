@@ -1,12 +1,12 @@
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { clip, MemoryStore, projectIdentity, TYPES, type Memory } from "./store.ts";
+import { clip, MemoryStore, projectIdentity, redact, TYPES, type Memory } from "./store.ts";
 import { search } from "./search.ts";
 import { validId } from "./model.ts";
-import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
+import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, MemoryModelError, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
 import { applyStaged, runForkExtraction } from "./fork-extraction.ts";
 
 const MemorySchema = Type.Object({
@@ -31,6 +31,12 @@ Write memories with the pmem_save tool, or with read/edit/write on the topic Mar
 const RULES_FILES_ONLY = MEMORY_INTRO + `
 There are no memory-specific tools: use read, edit and write like any other file. Create one <id>.md per memory in the memory directory named in the injected index, with flat YAML frontmatter (name, optional description, type) and a concise body. The index updates itself, so edit topic files, not MEMORY.md links.`;
 
+function addUsage(usage: Usage, prior: Usage) {
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) usage[key] += prior[key];
+  for (const key of ["reasoning", "cacheWrite1h"] as const) if (prior[key] !== undefined) usage[key] = (usage[key] ?? 0) + prior[key];
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) usage.cost[key] += prior.cost[key];
+}
+
 function result(memory: MemoryStore, notes: Memory[], truncated = false, nextOffset: number | null = null) {
   const data = { directory: memory.dir, indexPath: "MEMORY.md", notes: notes.map(note => ({ ...note, path: `${note.id}.md`, source: { ...note.source } })), truncated, nextOffset };
   const content = JSON.stringify(data);
@@ -43,6 +49,7 @@ export interface MemorySettings {
   everyNTurns: number; idleFlushSeconds: number; extractionMode: "call" | "fork";
 }
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
+const EXTRACTION_TIMEOUT_MS = 60_000;
 
 /** Configuration lives in Pi settings so it survives installs, like CC's autoMemory* keys. */
 export function parseMemorySettings(section: unknown): MemorySettings {
@@ -117,16 +124,17 @@ export default function projectMemory(pi: ExtensionAPI) {
     return { model: ctx.model, requested: configured };
   }
 
-  /** One bounded no-tool model call, then our own validated write. Runs detached from the turn. */
-  async function extractAndSave(ctx: ExtensionContext, signal: AbortSignal, leafAtStart: string | null, trigger: string) {
-    if (!enabled() || !ctx.sessionManager.getSessionFile() || signal.aborted) return;
+  /** Bounded no-tool extraction; retry invalid evidence once before rejecting the pass. */
+  async function extractAndSave(ctx: ExtensionContext, signal: AbortSignal, leafAtStart: string | null, trigger: string): Promise<{ status: "ok" | "failed" | "skipped"; reason?: string; saved?: string[] }> {
+    if (!enabled() || !ctx.sessionManager.getSessionFile() || signal.aborted) return { status: "skipped", reason: "disabled, ephemeral, or cancelled" };
     const evidence = evidenceSinceCheckpoint(ctx);
-    if (!evidence.some(entry => entry.role === "user" && entry.text.trim().length >= 4)) return;
+    if (!evidence.some(entry => entry.role === "user" && entry.text.trim().length >= 4)) return { status: "skipped", reason: "no new user evidence" };
     const memory = await getStore(ctx);
     const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
     if (!snapshot || snapshot.invalid) {
-      pi.appendEntry("pi-project-memory.extraction", { status: "failed", reason: snapshot ? "invalid_store" : "unreadable_store" });
-      return;
+      const reason = snapshot ? "invalid_store" : "unreadable_store";
+      pi.appendEntry("pi-project-memory.extraction", { status: "failed", reason });
+      return { status: "failed", reason };
     }
     const existing = [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 24).map(note => ({ id: note.id, type: note.type, title: note.title, content: clip(note.content, 160) }));
     const input = { evidence, existing, forgotten: snapshot.forgotten.filter(id => !id.startsWith("sha:")).slice(-128) };
@@ -135,7 +143,7 @@ export default function projectMemory(pi: ExtensionAPI) {
       else if (input.forgotten.length) input.forgotten.shift();
       else evidence.shift();
     }
-    if (!evidence.some(entry => entry.role === "user")) return;
+    if (!evidence.some(entry => entry.role === "user")) return { status: "skipped", reason: "no user evidence within input budget" };
     const { model, requested } = extractionModel(ctx);
     const mode = readSettings(pi).extractionMode;
     if (mode === "fork") {
@@ -147,39 +155,58 @@ export default function projectMemory(pi: ExtensionAPI) {
           evidence: input, index: snapshot.index, signal,
         });
         // Discard everything if the pass was cancelled: no partial notes.
-        if (signal.aborted) return;
+        if (signal.aborted) return { status: "skipped", reason: "cancelled" };
         const ids = (await applyStaged(memory.dir, result.staged)).map(name => name.replace(/\.md$/, ""));
         await memory.read({ tolerant: true }).catch(() => undefined);
         pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: ids, turns: result.turns, provider: model.provider, model: model.id, ...(requested ? { requestedModel: requested } : {}) });
         checkpoint();
         if (ctx.hasUI && ids.length) ctx.ui.notify(`Project memory: saved ${ids.length} note(s)`, "info");
+        return { status: "ok", saved: ids };
       } catch (error) {
-        if (signal.aborted) return;
-        pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, trigger, reason: clip(error instanceof Error ? error.message : String(error), 300), ...(requested ? { requestedModel: requested } : {}) });
-        if (ctx.hasUI) ctx.ui.notify("Project memory extraction failed; no notes changed.", "warning");
+        if (signal.aborted) return { status: "skipped", reason: "cancelled or timed out" };
+        const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
+        pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, trigger, reason, ...(requested ? { requestedModel: requested } : {}) });
+        if (ctx.hasUI) ctx.ui.notify(`Project memory extraction failed: ${reason}.`, "warning");
+        return { status: "failed", reason };
       }
-      return;
     }
     let response;
     try {
-      const answer = await modelJSON(ctx, model, EXTRACTION_PROMPT, input, signal);
+      let answer = await modelJSON(ctx, model, EXTRACTION_PROMPT, input, signal);
       response = answer.response;
-      const drafts = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId());
-      if (signal.aborted) return;
+      let drafts;
+      try { drafts = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId()); }
+      catch (error) {
+        if (!(error instanceof Error) || !error.message.startsWith("Ungrounded memory evidence:")) throw error;
+        const priorUsage = response.usage;
+        answer = await modelJSON(ctx, model, EXTRACTION_PROMPT + `\nThe previous attempt was rejected: ${error.message}. Correct the evidence references; omit unsupported memories.`, input, signal);
+        response = answer.response;
+        addUsage(response.usage, priorUsage);
+        drafts = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId());
+      }
+      if (signal.aborted) return { status: "skipped", reason: "cancelled" };
       // Claude Code abandons a pass once a newer turn started: the evidence is stale by then.
       if ((ctx.sessionManager.getLeafId() ?? null) !== leafAtStart) {
         pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "stale", trigger });
-        return;
+        return { status: "skipped", reason: "a newer turn started" };
       }
       const saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal });
       // Lifecycle callbacks cannot append a public UsageEntry; expose separate bookkeeping instead.
       pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
       checkpoint();
       if (ctx.hasUI && saved.length) ctx.ui.notify(`Project memory: saved ${saved.length} note(s)`, "info");
-    } catch {
-      if (signal.aborted) return;
-      pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, ...(response ? { provider: response.provider, model: response.model, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
-      if (ctx.hasUI) ctx.ui.notify("Project memory extraction failed; no notes changed. Retry /pmem extract after checking the provider/store.", "warning");
+      return { status: "ok", saved: saved.map(note => note.id) };
+    } catch (error) {
+      if (error instanceof MemoryModelError) {
+        const priorUsage = response?.usage;
+        response = error.response;
+        if (priorUsage) addUsage(response.usage, priorUsage);
+      }
+      if (signal.aborted) return { status: "skipped", reason: "cancelled or timed out" };
+      const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
+      pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, reason, ...(response ? { provider: response.provider, model: response.model, stopReason: response.stopReason, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
+      if (ctx.hasUI) ctx.ui.notify(`Project memory extraction failed: ${reason}. No notes changed. Retry /pmem extract after checking the provider/store.`, "warning");
+      return { status: "failed", reason };
     }
   }
 
@@ -190,8 +217,8 @@ export default function projectMemory(pi: ExtensionAPI) {
     if (!lifecycle) return;
     if (jobs.size) { trailing = true; return; }
     const leaf = ctx.sessionManager.getLeafId() ?? null;
-    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(20_000)]);
-    const job: Promise<void> = extractAndSave(ctx, signal, leaf, trigger).catch(() => {}).finally(() => {
+    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(EXTRACTION_TIMEOUT_MS)]);
+    const job: Promise<void> = extractAndSave(ctx, signal, leaf, trigger).then(() => {}).catch(() => {}).finally(() => {
       jobs.delete(job);
       if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
     });
@@ -350,8 +377,10 @@ export default function projectMemory(pi: ExtensionAPI) {
       }
       if (action === "extract") {
         if (!enabled() || !ctx.sessionManager.getSessionFile()) throw new Error("Extraction requires an enabled, persistent session");
-        await extractAndSave(ctx, AbortSignal.any([AbortSignal.timeout(30_000), ...(ctx.signal ? [ctx.signal] : [])]), ctx.sessionManager.getLeafId() ?? null, "manual");
-        report("Memory extraction attempted; /pmem list shows stored notes. Usage/status is recorded as pi-project-memory.extraction entries."); return;
+        const result = await extractAndSave(ctx, AbortSignal.any([AbortSignal.timeout(EXTRACTION_TIMEOUT_MS), ...(ctx.signal ? [ctx.signal] : [])]), ctx.sessionManager.getLeafId() ?? null, "manual");
+        report(result.status === "ok"
+          ? `Memory extraction completed; saved ${result.saved?.length ?? 0} note(s). /pmem list shows stored notes.`
+          : `Memory extraction ${result.status}: ${result.reason}.`); return;
       }
       const memory = await getStore(ctx);
       if (action === "forget") {
