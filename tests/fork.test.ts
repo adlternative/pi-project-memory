@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { makeHarness, tool, waitForExtraction } from "./harness.ts";
-import { applyStaged, memoryTools } from "../src/fork-extraction.ts";
+import { applyStaged, memoryTools, runForkExtraction } from "../src/fork-extraction.ts";
 import { renderTopic } from "../src/markdown.ts";
 
 const note = { id: "package-manager", type: "feedback" as const, title: "Package manager", content: "Use pnpm, not npm.", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", source: { sessionId: "s", entryId: "e", quote: "q", origin: "file" as const } };
@@ -26,6 +26,27 @@ test("sub-agent tools validate, stage, and only touch memory files", async t => 
   assert.match((await read.execute("7", { path: "package-manager.md" })).content[0].text, /type: feedback/);
   assert.deepEqual(await applyStaged(root, staged), ["package-manager.md"]);
   assert.match(await readFile(join(root, "package-manager.md"), "utf8"), /type: feedback/);
+});
+
+test("the fork sub-agent also uses the model's own output budget and disables hidden qoder/fast reasoning", async t => {
+  const root = await mkdtemp(resolve(".sandbox", "fork-options-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const [provider, id, disabled] of [["qoder", "fast", true], ["qoder", "ultimate", false]] as const) {
+    const seen: { maxTokens?: number; reasoning?: string; payload: Record<string, unknown> }[] = [];
+    const model = { provider, id, api: "openai-completions", reasoning: false } as never;
+    const modelRegistry = { streamSimple: (_model: unknown, _context: unknown, options: { maxTokens?: number; reasoning?: string; onPayload?: (payload: unknown) => unknown }) => ({
+      result: async () => {
+        const payload = { model: id, messages: [] };
+        seen.push({ maxTokens: options.maxTokens, reasoning: options.reasoning, payload: (options.onPayload?.(payload) ?? payload) as Record<string, unknown> });
+        return { stopReason: "stop", content: [{ type: "text", text: "done" }], usage: {} };
+      },
+    }) } as never;
+    const result = await runForkExtraction({ model, modelRegistry, memoryDir: root, evidence: {}, index: "", signal: AbortSignal.timeout(5_000) });
+    assert.equal(result.turns, 1);
+    assert.equal(seen[0].maxTokens, undefined, "no memory-specific token cap in fork mode either");
+    assert.equal(seen[0].payload.reasoning_effort, disabled ? "none" : undefined);
+    assert.equal(seen[0].reasoning, disabled ? undefined : "low");
+  }
 });
 
 test("a discarded pass writes nothing, so no partial notes survive", async t => {

@@ -199,7 +199,7 @@ Nothing is written when the feature is disabled, in ephemeral sessions, when the
 
 Background extraction runs detached, so the turn settles immediately. Only one pass runs at a time; a pass is discarded when a newer turn has already started. Results are re-checked against the store revision before writing, and a shutdown first runs a pending idle pass, then drains in-flight work for up to 15 seconds.
 
-`call` mode applies validated JSON and retries once if the model's evidence reference or verbatim quote is invalid, within the same time budget. Its `qoder/fast` requests explicitly disable reasoning because the gateway can otherwise spend the entire output budget on hidden reasoning. `fork` mode gives a sub-agent up to six turns with `read_memory` and `write_memory`, both confined to the current project's memory directory, then applies its staged files atomically. A cancelled or failed pass discards everything.
+`call` mode applies validated JSON and retries once if the model's evidence reference or verbatim quote is invalid, within the same time budget. Its `qoder/fast` requests explicitly disable reasoning because the gateway can otherwise spend the entire output budget on hidden reasoning. `fork` mode gives a sub-agent up to six turns with `read_memory` and `write_memory`, both confined to the current project's memory directory, then applies its staged files atomically. Both modes use the model's own output limit and the same reasoning setting. A cancelled or failed pass discards everything.
 
 ## Retrieval and limits
 

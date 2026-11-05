@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseTopic } from "./markdown.ts";
 import { clip, validId } from "./model.ts";
+import { modelCallOptions } from "./intelligence.ts";
 
 export interface ScopedTool {
   name: string;
@@ -107,9 +108,7 @@ export async function runForkExtraction(input: ForkInput): Promise<{ staged: Map
   const limit = input.maxTurns ?? 6;
   for (let turns = 1; turns <= limit; turns++) {
     if (input.signal.aborted) break;
-    const reply = await input.modelRegistry.streamSimple(input.model, { messages, tools: declarations }, {
-      maxTokens: 2000, reasoning: "low", cacheRetention: "none", signal: input.signal,
-    }).result();
+    const reply = await input.modelRegistry.streamSimple(input.model, { messages, tools: declarations }, modelCallOptions(input.model, input.signal)).result();
     if (reply.stopReason !== "toolUse") return { staged, turns };
     messages.push(reply);
     for (const call of reply.content.filter((part): part is ToolCall => part.type === "toolCall")) {
