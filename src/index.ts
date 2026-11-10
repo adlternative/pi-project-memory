@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { clip, fingerprint, MemoryStore, projectIdentity, redact, TYPES, type Memory } from "./store.ts";
+import { clip, fingerprint, MemoryStore, projectIdentity, record, redact, TYPES, validateInput, type Memory } from "./store.ts";
 import { search } from "./search.ts";
 import { INDEX_BYTES, INDEX_SOFT_RATIO } from "./markdown.ts";
 import { validId } from "./model.ts";
@@ -49,6 +49,7 @@ function result(memory: MemoryStore, notes: Memory[], truncated = false, nextOff
 export interface MemorySettings {
   enabled: boolean; directory?: string; autoExtract: boolean; extractModel: string; dedicatedTools: boolean;
   everyNTurns: number; idleFlushSeconds: number; extractionMode: "call" | "fork";
+  dream: boolean; dreamMinHours: number; dreamMinSessions: number;
 }
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
 const EXTRACTION_TIMEOUT_MS = 60_000;
@@ -66,6 +67,9 @@ export function parseMemorySettings(section: unknown): MemorySettings {
     everyNTurns: Math.round(number(value.everyNTurns, 5, 1, 100)),
     idleFlushSeconds: number(value.idleFlushSeconds, 120, 0, 86_400),
     extractionMode: value.extractionMode === "fork" ? "fork" : "call",
+    dream: value.dream === true,
+    dreamMinHours: number(value.dreamMinHours, 24, 0, 24 * 365),
+    dreamMinSessions: Math.round(number(value.dreamMinSessions, 5, 1, 1000)),
   };
 }
 
@@ -262,6 +266,54 @@ export default function projectMemory(pi: ExtensionAPI) {
     idleTimer = timer;
   }
 
+  const DREAM_PROMPT = `Consolidate this project's memory. Return JSON only: {"updates":[{"id":"existing-id","type":"...","title":"...","content":"..."}],"deletes":["existing-id"],"note":"one sentence"}
+
+Rules: ids must already exist - never invent one. Merge notes that say the same thing, keep the clearest title, move detail into the surviving note. Delete only notes that are wrong, obsolete, or fully covered elsewhere. Never delete more than a quarter of the notes. Do not add new memories; this pass only tightens what exists. Return empty arrays when nothing should change.`;
+
+  /**
+   * Claude Code style dream: one consolidation pass over the existing notes, applied as one transaction.
+   * Runs on a cadence (min hours AND min sessions) or on demand, never concurrently with another pass.
+   */
+  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual"): Promise<{ updated: number; deleted: number } | undefined> {
+    if (!lifecycle) return undefined;
+    if (jobs.size) { trailing = true; return undefined; }
+    const memory = await getStore(ctx);
+    const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
+    if (!snapshot || snapshot.invalid || !snapshot.notes.length) return undefined;
+    const { model, requested } = extractionModel(ctx);
+    const candidates = [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 60)
+      .map(note => ({ id: note.id, type: note.type, title: note.title, content: clip(note.content, 400) }));
+    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(60_000)]);
+    const job: Promise<void> = (async () => {
+      try {
+        const { data, response } = await modelJSON(ctx, model, DREAM_PROMPT, { index: snapshot.index, notes: candidates }, signal);
+        const plan = record(data);
+        if (Object.keys(plan).some(key => !["updates", "deletes", "note"].includes(key))) throw new Error("Unexpected field in dream plan");
+        const updates = Array.isArray(plan.updates) ? plan.updates : [];
+        const deletes = Array.isArray(plan.deletes) ? plan.deletes.filter((id): id is string => typeof id === "string") : [];
+        const drafts = updates.map(item => {
+          const value = record(item);
+          return {
+            ...validateInput(value),
+            source: { sessionId: ctx.sessionManager.getSessionId(), entryId: "dream", quote: clip(String(plan.note ?? "consolidation"), 400), origin: "extracted" as const },
+          };
+        });
+        const applied = drafts.length || deletes.length
+          ? await memory.consolidate(drafts, deletes, { expectedRevision: snapshot.revision, signal })
+          : { updated: 0, deleted: 0 };
+        pi.appendEntry("pi-project-memory.dream", { status: "ok", trigger, updated: applied.updated, deleted: applied.deleted, provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+        checkpoint();
+        if (ctx.hasUI && (applied.updated || applied.deleted)) ctx.ui.notify(`Memory consolidated: ${applied.updated} updated, ${applied.deleted} removed.`, "info");
+      } catch (error) {
+        if (signal.aborted) return;
+        pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, reason: clip(redact(error instanceof Error ? error.message : String(error)), 300) });
+        if (ctx.hasUI) ctx.ui.notify("Memory consolidation failed; notes are unchanged.", "warning");
+      }
+    })().catch(() => {}).finally(() => { jobs.delete(job); if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); } });
+    jobs.add(job);
+    return undefined;
+  }
+
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
     if (typeof path !== "string") return;
     const root = rootFor(ctx.cwd);
@@ -286,12 +338,20 @@ export default function projectMemory(pi: ExtensionAPI) {
     catch { return { isError: true, content: [{ type: "text", text: "The Markdown edit is on disk but memory ingestion failed. Fix its flat frontmatter/content/size or resolve the store conflict. The edit was not silently rolled back." }] }; }
   });
 
-  pi.on("session_start", () => {
+  pi.on("session_start", async (_event, ctx) => {
     epoch++; clearIdle(); lifecycle?.abort(); lifecycle = new AbortController(); store = undefined; run = undefined; turnsSinceExtract = 0; trailing = false;
     const flag = pi.getFlag("memory-auto");
     auto = typeof flag === "boolean" ? flag : readSettings(pi).autoExtract;
     // Default parity with Claude Code and Codex: the memory directory is the interface, so tools are opt-in.
     if (!readSettings(pi).dedicatedTools) pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("pmem_")));
+    const settings = readSettings(pi);
+    if (!settings.enabled) return;
+    // Count this session synchronously so the cadence is deterministic, then consolidate in the background when due.
+    let dream = { lastAt: 0, sessionsSince: 0 };
+    try { dream = await (await getStore(ctx)).noteDreamSession(); } catch { return; }
+    const dueHours = dream.lastAt === 0 || Date.now() - dream.lastAt >= settings.dreamMinHours * 3_600_000;
+    if (!settings.dream || !dueHours || dream.sessionsSince < settings.dreamMinSessions) return;
+    await runDream(ctx, "schedule");
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     epoch++; run = undefined; store = undefined;
@@ -388,7 +448,7 @@ export default function projectMemory(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("pmem", {
-    description: "Project memory: status | list [offset] | show <id> | forget <id> | auto on/off | extract",
+    description: "Project memory: status | list [offset] | show <id> | forget <id> | auto on/off | extract | dream | compact [apply]",
     handler: async (args, ctx) => {
       const [action = "status", value] = args.trim().split(/\s+/);
       if (action === "auto") {
@@ -416,13 +476,19 @@ export default function projectMemory(pi: ExtensionAPI) {
       const state = await memory.read({ tolerant: true });
       const indexBytes = Buffer.byteLength(state.index);
       const index = { bytes: indexBytes, limit: INDEX_BYTES, percent: Math.round(indexBytes / INDEX_BYTES * 100) };
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, dream: { enabled: readSettings(pi).dream, minHours: readSettings(pi).dreamMinHours, minSessions: readSettings(pi).dreamMinSessions }, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");
         report({ notes: state.notes.slice(offset, offset + 10).map(({ id, type, title }) => ({ id, type, title })), nextOffset: offset + 10 < state.notes.length ? offset + 10 : null }); return;
       }
       if (action === "show") { const note = state.notes.find(note => note.id === value); if (!note) throw new Error("Memory not found"); report(note); return; }
+      if (action === "dream") {
+        if (!enabled()) throw new Error("Memory is disabled for this process");
+        await runDream(ctx, "manual");
+        report("Memory consolidation requested; it runs in the background and records a pi-project-memory.dream entry.");
+        return;
+      }
       if (action === "compact") {
         // Local, no model call: exact duplicates plus stale notes, applied only when asked.
         const groups = new Map<string, Memory[]>();
@@ -440,7 +506,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         report({ index: { bytes: Buffer.byteLength(after.index), limit: INDEX_BYTES }, applied, duplicates, stale });
         return;
       }
-      report("Use /pmem status | list [offset] | show <id> | forget <id> | auto on/off | extract");
+      report("Use /pmem status | list [offset] | show <id> | forget <id> | auto on/off | extract | dream | compact [apply]");
     },
   });
 }

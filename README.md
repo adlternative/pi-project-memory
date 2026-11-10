@@ -153,6 +153,9 @@ Configure memory in Pi settings so it survives installs. Use user scope (`~/.pi/
 | `dedicatedTools` | `false` | Expose `pmem_list`/`pmem_read`/`pmem_search`/`pmem_save`; off means files are the interface |
 | `everyNTurns` | `5` | Run one extraction pass every N user prompts |
 | `idleFlushSeconds` | `120` | Also run a pass after this much inactivity; `0` disables it |
+| `dream` | `false` | Opt in to background consolidation: merge, tighten and prune with one model pass |
+| `dreamMinHours` | `24` | Consolidate only when the last pass is at least this old |
+| `dreamMinSessions` | `5` | ...and at least this many sessions started since |
 | `extractionMode` | `"call"` | `"call"` sends a no-tool JSON request with at most one retry for invalid evidence; `"fork"` runs a bounded sub-agent with two memory-only tools |
 
 Per-run overrides exist for experiments and automation; a flag affects only the process it is passed to. Precedence is flag, then settings, then default.
@@ -184,6 +187,7 @@ Structured output is `{directory,indexPath,notes,truncated,nextOffset}`; each `n
 | `/pmem forget <id>` | Delete the topic, drop its link, record a tombstone |
 | `/pmem compact` | Report exact duplicates and notes unused for 180 days, plus index usage |
 | `/pmem compact apply` | Delete the extra copies of exact duplicates |
+| `/pmem dream` | Consolidate now: merge duplicates, tighten wording, delete what is obsolete |
 | `/pmem auto on\|off` | Toggle extraction for this session only |
 | `/pmem extract` | Run a pass now, synchronously |
 
@@ -275,7 +279,8 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 
 ## Limitations
 
-- No consolidation pass, no team or cloud sync, no per-subagent store.
+- No team or cloud sync, and no per-subagent store.
+- Consolidation (`dream`) is off by default. When on it runs once per `dreamMinHours` and `dreamMinSessions`, deletes at most a quarter of the notes in one pass, and records a `pi-project-memory.dream` entry.
 - The binding limit is the 25 KB index, as in Claude Code: near it the extension warns, and at it new notes are skipped with `index_full` until you compact or forget. The 1,024-topic cap is only a safety net.
 - `forget` is not privacy-grade erasure.
 - Fork-mode writes are applied file by file at the end, so a crash during that short window can still leave a subset written.

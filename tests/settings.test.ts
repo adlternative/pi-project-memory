@@ -18,13 +18,14 @@ const lastReport = (h: Awaited<ReturnType<typeof makeHarness>>) => {
 };
 
 test("settings decide the memory directory and expand a leading ~/", async t => {
-  const base = "~/pi-memory-settings-test";
+  const name = `pi-memory-settings-test-${process.pid}`;
+  const base = `~/${name}`;
   const h = await makeHarness(t, { useFlags: false, settings: { projectMemory: { directory: base } } });
   await h.session.prompt("/pmem");
-  const expected = h.store.dir.replace(h.memoryDir, join(homedir(), "pi-memory-settings-test"));
+  const expected = h.store.dir.replace(h.memoryDir, join(homedir(), name));
   assert.equal(lastReport(h).directory, expected);
   // Reading config must not create anything in the home directory.
-  await assert.rejects(readdir(join(homedir(), "pi-memory-settings-test")), /ENOENT/);
+  await assert.rejects(readdir(join(homedir(), name)), /ENOENT/);
 });
 
 test("a per-run flag still overrides the persisted setting", async t => {
@@ -209,4 +210,43 @@ test("/pmem status reports the index budget", async t => {
   const report = lastReport(h);
   assert.equal(report.index.limit, 25000);
   assert.ok(report.index.bytes > 0 && report.index.bytes < report.index.limit);
+});
+
+test("dream defaults are off with Claude Code's cadence", async () => {
+  const { parseMemorySettings } = await import("../src/index.ts");
+  const defaults = parseMemorySettings(undefined);
+  assert.equal(defaults.dream, false);
+  assert.equal(defaults.dreamMinHours, 24);
+  assert.equal(defaults.dreamMinSessions, 5);
+});
+
+test("/pmem dream consolidates updates and deletions in one pass", async t => {
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true } },
+    answer: request => (JSON.stringify(request.context).includes("Consolidate this project's memory")
+      ? JSON.stringify({ updates: [{ id: "alpha", type: "feedback", title: "Package manager", content: "Use pnpm, never npm." }], deletes: ["beta"], note: "merged alpha and beta" })
+      : "Done."),
+  });
+  for (const [id, content] of [["alpha", "Use pnpm."], ["beta", "Use pnpm in this repo."], ["gamma", "Reviews go to the payments group."]] as const) {
+    await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(h.store.dir, `${id}.md`), renderTopic({ ...note, id, content, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+  }
+  assert.equal((await h.store.read()).notes.length, 3);
+
+  await h.session.prompt("/pmem dream");
+  const deadline = Date.now() + 20_000;
+  let entry;
+  while (Date.now() < deadline) {
+    entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.dream");
+    if (entry) break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.ok(entry && entry.type === "custom", "expected a dream entry");
+  const data = entry.data as { status?: string; updated?: number; deleted?: number };
+  assert.equal(data.status, "ok");
+  assert.equal(data.updated, 1);
+  assert.equal(data.deleted, 1);
+  const state = await h.store.read();
+  assert.deepEqual(state.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
+  assert.equal(state.notes.find(item => item.id === "alpha")?.content, "Use pnpm, never npm.");
 });

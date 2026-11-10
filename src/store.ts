@@ -9,7 +9,7 @@ export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInpu
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
 
 interface Metadata { hash: string; contentHash: string; source: Source; createdAt: string; updatedAt: string }
-interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string }
+interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string; dream?: { lastAt: number; sessionsSince: number } }
 interface Loaded { state: State; disk: DiskState; metadata: FileText | null; index: FileText | null; documents: Map<string, FileText> }
 const emptyDisk = (): DiskState => ({ version: 2, revision: 0, records: {}, forgotten: [], indexHash: hash("") });
 const emptyState = (): State => ({ version: 2, revision: 0, notes: [], forgotten: [], index: renderIndex(null, []) });
@@ -25,7 +25,10 @@ function validateDisk(value: unknown): DiskState {
     if (!validId(id) || typeof entry.hash !== "string" || !/^[a-f0-9]{64}$/.test(entry.hash) || typeof entry.contentHash !== "string" || !/^sha:[a-f0-9]{64}$/.test(entry.contentHash)) throw new Error("Invalid memory metadata");
     return [id, { hash: entry.hash, contentHash: entry.contentHash, source: validateSource(entry.source), createdAt: timestamp(entry.createdAt), updatedAt: timestamp(entry.updatedAt) }];
   }));
-  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash };
+  const rawDream = record(disk.dream ?? {});
+  const lastAt = typeof rawDream.lastAt === "number" && Number.isFinite(rawDream.lastAt) ? rawDream.lastAt : 0;
+  const sessionsSince = typeof rawDream.sessionsSince === "number" && Number.isFinite(rawDream.sessionsSince) ? Math.max(0, Math.floor(rawDream.sessionsSince)) : 0;
+  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash, dream: { lastAt, sessionsSince } };
 }
 
 export interface ProjectIdentity { key: string; name: string }
@@ -86,7 +89,7 @@ export class MemoryStore {
     this.files = new MemoryFiles(this.dir);
   }
 
-  private async persist(loaded: Loaded, notes: Memory[], forgotten: string[], edits: Map<string, string | null>, extras: Change[] = [], signal?: AbortSignal) {
+  private async persist(loaded: Loaded, notes: Memory[], forgotten: string[], edits: Map<string, string | null>, extras: Change[] = [], signal?: AbortSignal, dream = loaded.disk.dream) {
     if (notes.length > MAX_NOTES) throw new Error("Memory limit reached; review /pmem list and forget obsolete notes");
     const index = renderIndex(loaded.index?.text ?? null, notes);
     const records = Object.fromEntries([...notes].sort((a, b) => a.id.localeCompare(b.id)).map(note => {
@@ -95,7 +98,7 @@ export class MemoryStore {
       if (body === undefined || body === null) throw new Error("Missing Markdown for memory metadata");
       return [note.id, noteMetadata(note, hash(body))];
     }));
-    const disk = validateDisk({ version: 2, revision: loaded.disk.revision + 1, records, forgotten: forgotten.slice(-MAX_FORGOTTEN), indexHash: hash(index) });
+    const disk = validateDisk({ version: 2, revision: loaded.disk.revision + 1, records, forgotten: forgotten.slice(-MAX_FORGOTTEN), indexHash: hash(index), ...(dream ? { dream } : {}) });
     const changes: Change[] = [...edits].map(([name, after]) => ({ name, before: loaded.documents.get(name)?.hash ?? null, after }));
     changes.push(...extras);
     if (index !== loaded.index?.text) changes.push({ name: "MEMORY.md", before: loaded.index?.hash ?? null, after: index });
@@ -213,6 +216,58 @@ export class MemoryStore {
       }
       if (edits.size || JSON.stringify(forgotten) !== JSON.stringify(loaded.state.forgotten)) await this.persist(loaded, notes, forgotten, edits, [], options.signal);
       return saved;
+    }, options.signal);
+  }
+
+  /** Records one session for dream eligibility; returns the counters. */
+  async noteDreamSession(): Promise<{ lastAt: number; sessionsSince: number }> {
+    // Starting a session must not create a store or a directory that was never used.
+    if (!await this.files.directory(false)) return { lastAt: 0, sessionsSince: 0 };
+    await this.adoptLegacyDir();
+    return this.files.locked(async () => {
+      const loaded = await this.load();
+      const dream = { lastAt: loaded.disk.dream?.lastAt ?? 0, sessionsSince: (loaded.disk.dream?.sessionsSince ?? 0) + 1 };
+      const disk = { ...loaded.disk, dream };
+      await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify(disk, null, 2) + "\n" }]);
+      return dream;
+    });
+  }
+
+  /** Applies a dream plan atomically: updates must exist, deletions are bounded and tombstoned. */
+  async consolidate(updates: Draft[], deletes: string[], options: { expectedRevision?: number; signal?: AbortSignal } = {}): Promise<{ updated: number; deleted: number }> {
+    const validated = updates.map(update => ({ ...validateInput(update), source: validateSource(update.source) }));
+    const removals = [...new Set(deletes)];
+    for (const id of removals) if (!validId(id)) throw new Error(`Invalid memory id: ${id}`);
+    await this.adoptLegacyDir();
+    return this.files.locked(async () => {
+      const loaded = await this.load();
+      if (options.expectedRevision !== undefined && loaded.state.revision !== options.expectedRevision) throw new Error("Memory changed during consolidation; stale plan discarded");
+      const notes = [...loaded.state.notes];
+      let forgotten = [...loaded.state.forgotten];
+      const edits = new Map<string, string | null>();
+      const now = new Date().toISOString();
+      let updated = 0;
+      for (const input of validated) {
+        const index = notes.findIndex(note => note.id === input.id);
+        if (index < 0) throw new Error(`Consolidation referenced an unknown id: ${input.id}`);
+        const existing = notes[index];
+        notes[index] = { ...existing, ...input, createdAt: existing.createdAt, updatedAt: now };
+        edits.set(`${input.id}.md`, renderTopic(notes[index]));
+        updated += 1;
+      }
+      if (removals.length > Math.max(1, Math.floor(loaded.state.notes.length / 4))) throw new Error("Consolidation tried to delete too many notes; nothing was changed");
+      let deleted = 0;
+      for (const id of removals) {
+        const note = notes.find(item => item.id === id);
+        if (!note) continue;
+        forgotten = [...new Set([...forgotten, id, fingerprint(note.content)])];
+        edits.set(`${id}.md`, null);
+        deleted += 1;
+      }
+      const kept = notes.filter(note => !removals.includes(note.id));
+      const dream = { lastAt: Date.now(), sessionsSince: 0 };
+      await this.persist(loaded, kept, forgotten, edits, [], options.signal, dream);
+      return { updated, deleted };
     }, options.signal);
   }
 

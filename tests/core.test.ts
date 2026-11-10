@@ -347,3 +347,33 @@ test("a hash-only folder from an earlier version is renamed in place, keeping it
   await assert.rejects(readdir(legacy.dir), /ENOENT/);
   assert.deepEqual((await named.read()).notes, state.notes);
 });
+
+test("consolidation applies updates and deletions together and rejects unsafe plans", async t => {
+  const { store } = await fixture(t);
+  await store.save([draft("alpha", "Use pnpm."), draft("beta", "Use pnpm in this repo."), draft("gamma", "Reviews go to the payments group.")]);
+  const before = await store.read();
+  const result = await store.consolidate(
+    [{ ...draft("alpha", "Use pnpm, never npm."), createdAt: undefined as never } as never],
+    ["beta"],
+  );
+  assert.deepEqual(result, { updated: 1, deleted: 1 });
+  const after = await store.read();
+  assert.deepEqual(after.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
+  assert.ok(after.forgotten.includes("beta"));
+  assert.ok(after.revision > before.revision);
+
+  await assert.rejects(store.consolidate([draft("missing", "x")], []), /unknown id/);
+  await assert.rejects(store.consolidate([], ["alpha", "gamma"]), /delete too many/);
+  assert.equal((await store.read()).revision, after.revision);
+});
+
+test("dream counters advance per session and never create an unused store", async t => {
+  const { root } = await fixture(t);
+  const store = new MemoryStore(root, hash("project-b").slice(0, 24), "project-b");
+  assert.deepEqual(await store.noteDreamSession(), { lastAt: 0, sessionsSince: 0 });
+  await assert.rejects(readdir(store.dir), /ENOENT/);
+
+  await store.save([draft()]);
+  assert.deepEqual(await store.noteDreamSession(), { lastAt: 0, sessionsSince: 1 });
+  assert.deepEqual(await store.noteDreamSession(), { lastAt: 0, sessionsSince: 2 });
+});
