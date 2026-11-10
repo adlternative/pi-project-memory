@@ -347,3 +347,31 @@ test("a hash-only folder from an earlier version is renamed in place, keeping it
   await assert.rejects(readdir(legacy.dir), /ENOENT/);
   assert.deepEqual((await named.read()).notes, state.notes);
 });
+
+test("a full store keeps updates and drops new notes instead of failing the pass", async t => {
+  const { store } = await fixture(t);
+  const total = 256;
+  for (let i = 0; i < total; i += 4) {
+    await store.save(Array.from({ length: 4 }, (_, j) => draft(`note-${i + j}`, `Distinct bounded fact ${i + j}`)));
+  }
+  assert.equal((await store.read()).notes.length, total);
+  const before = await store.read();
+  const saved = await store.save([
+    draft("note-0", "An updated fact for an existing note."),
+    draft("brand-new", "This new note cannot fit."),
+  ], { skipWhenFull: true });
+  assert.deepEqual(saved.map(note => note.id), ["note-0"]);
+  const after = await store.read();
+  assert.equal(after.notes.length, total);
+  assert.equal(after.notes.find(note => note.id === "note-0")?.content, "An updated fact for an existing note.");
+  assert.equal(after.notes.some(note => note.id === "brand-new"), false);
+  assert.ok(after.revision > before.revision);
+});
+
+test("an explicit save is still rejected at capacity", async t => {
+  const { store } = await fixture(t);
+  for (let i = 0; i < 256; i += 4) {
+    await store.save(Array.from({ length: 4 }, (_, j) => draft(`note-${i + j}`, `Distinct bounded fact ${i + j}`)));
+  }
+  await assert.rejects(store.save([draft("overflow", "No room for this.")]), /Memory limit reached/);
+});

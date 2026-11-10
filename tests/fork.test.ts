@@ -98,3 +98,14 @@ test("fork mode writes notes through its scoped tools and records them", async t
   assert.match(await readFile(join(h.store.dir, "MEMORY.md"), "utf8"), /\(package-manager\.md\)/);
   assert.equal((await h.store.read()).notes.length, 1);
 });
+
+test("the sub-agent cannot add notes past capacity", async t => {
+  const root = await mkdtemp(resolve(".sandbox", "fork-capacity-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const staged = new Map<string, string>();
+  const existing = new Set(["package-manager"]);
+  const [, write] = memoryTools(root, staged, { existing, atCapacity: true });
+  await assert.rejects(write.execute("1", { path: "brand-new.md", content: renderTopic({ ...note, id: "brand-new" }) }), /at capacity/);
+  const ok = await write.execute("2", { path: "package-manager.md", content: renderTopic(note) });
+  assert.match(ok.content[0].text, /Staged package-manager.md/);
+});

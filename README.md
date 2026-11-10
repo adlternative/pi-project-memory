@@ -209,7 +209,7 @@ Background extraction runs detached, so the turn settles immediately. Only one p
 
 | Resource | Limit |
 |---|---:|
-| Topics per project | 128 |
+| Topics per project | 256 |
 | Title / description / body | 160 / 320 / 2,000 UTF-8 bytes |
 | Topic file including frontmatter | 4,096 bytes |
 | MEMORY.md | 25,000 bytes |
@@ -274,6 +274,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 ## Limitations
 
 - No consolidation pass, no team or cloud sync, no per-subagent store.
+- At the topic cap, extraction keeps updating existing notes and skips new ones (recording `dropped`); an explicit save is refused until you forget something.
 - `forget` is not privacy-grade erasure.
 - Fork-mode writes are applied file by file at the end, so a crash during that short window can still leave a subset written.
 - Developed and tested on macOS with Pi 1.2.0; Linux and Windows are unverified, as is power-loss durability.

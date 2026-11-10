@@ -5,7 +5,7 @@ import { join, parse, relative, sep } from "node:path";
 import { hostname } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { hash, record, validId } from "./model.ts";
+import { hash, MAX_NOTES, record, validId } from "./model.ts";
 import { INDEX_BYTES, TOPIC_BYTES } from "./markdown.ts";
 
 export interface FileText { text: string; hash: string; modifiedAt: string }
@@ -105,7 +105,7 @@ export class MemoryFiles {
   async topics(): Promise<string[]> {
     const names = (await readdir(this.dir)).filter(name => !name.startsWith(".") && name.endsWith(".md") && name !== "MEMORY.md").sort();
     if (names.some(name => !validId(name.slice(0, -3)))) throw new Error("Topic filenames must be lowercase kebab/snake ids, not memory.md");
-    if (names.length > 128) throw new Error("Memory limit reached; review topic files before continuing");
+    if (names.length > MAX_NOTES) throw new Error("Memory limit reached; review topic files before continuing");
     return names;
   }
 

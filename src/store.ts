@@ -175,7 +175,7 @@ export class MemoryStore {
     return this.files.locked(async () => (await this.load(options.tolerant)).state);
   }
 
-  async save(drafts: Draft[], options: { automatic?: boolean; expectedRevision?: number; signal?: AbortSignal } = {}): Promise<Memory[]> {
+  async save(drafts: Draft[], options: { automatic?: boolean; expectedRevision?: number; signal?: AbortSignal; skipWhenFull?: boolean } = {}): Promise<Memory[]> {
     if (drafts.length > 4) throw new Error("At most four memories per save");
     const validated = drafts.map(draft => ({ ...validateInput(draft), source: validateSource(draft.source) }));
     await this.adoptLegacyDir();
@@ -200,7 +200,14 @@ export class MemoryStore {
         const now = new Date().toISOString();
         const note: Memory = { ...input, ...(description === undefined ? {} : { description }), id: existing?.id ?? input.id, createdAt: existing?.createdAt ?? now, updatedAt: now };
         if (existing) notes[notes.indexOf(existing)] = note;
-        else { if (notes.length >= MAX_NOTES) throw new Error("Memory limit reached; review /pmem list and forget obsolete notes"); notes.push(note); }
+        else {
+          if (notes.length >= MAX_NOTES) {
+            // Extractions drop new notes at capacity instead of discarding the whole batch (updates above still apply).
+            if (options.skipWhenFull) continue;
+            throw new Error("Memory limit reached; review /pmem list and forget obsolete notes");
+          }
+          notes.push(note);
+        }
         edits.set(`${note.id}.md`, renderTopic(note));
         saved.push(note);
       }

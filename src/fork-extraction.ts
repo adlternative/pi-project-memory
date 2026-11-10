@@ -3,7 +3,7 @@ import type { Api, Message, Model, ToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseTopic } from "./markdown.ts";
-import { clip, validId } from "./model.ts";
+import { clip, MAX_NOTES, validId } from "./model.ts";
 import { modelCallOptions } from "./intelligence.ts";
 
 export interface ScopedTool {
@@ -24,7 +24,9 @@ function scopedPath(memoryDir: string, path: string): string {
 }
 
 /** Memory-root-scoped tools: the sub-agent never sees shell, edit, or the wider filesystem. */
-export function memoryTools(memoryDir: string, staged: Map<string, string>): ScopedTool[] {
+export interface ToolLimits { existing?: ReadonlySet<string>; atCapacity?: boolean }
+
+export function memoryTools(memoryDir: string, staged: Map<string, string>, limits: ToolLimits = {}): ScopedTool[] {
   return [
     {
       name: "read_memory",
@@ -51,6 +53,10 @@ export function memoryTools(memoryDir: string, staged: Map<string, string>): Sco
       async execute(_id, params) {
         const target = scopedPath(memoryDir, params.path);
         if (relative(memoryDir, target) === "MEMORY.md") throw new Error("MEMORY.md is maintained automatically; write topic files instead");
+        const id = relative(memoryDir, target).replace(/\.md$/, "");
+        if (limits.atCapacity && !limits.existing?.has(id) && !staged.has(params.path)) {
+          throw new Error(`Memory is at capacity (${limits.existing?.size ?? 0} notes). Update an existing note instead of adding one.`);
+        }
         parseTopic(params.path, params.content);
         staged.set(params.path, params.content);
         return { content: [{ type: "text" as const, text: `Staged ${params.path}` }], details: undefined };
@@ -73,6 +79,7 @@ export interface ForkInput {
   index: string;
   signal: AbortSignal;
   maxTurns?: number;
+  existingIds?: string[];
 }
 
 /** Applies the sub-agent's staged files only after its loop finished, one atomic rename each. */
@@ -97,7 +104,8 @@ export async function applyStaged(memoryDir: string, staged: Map<string, string>
 /** Bounded tool loop on the parent's registry: one assistant turn per iteration, no nested session. */
 export async function runForkExtraction(input: ForkInput): Promise<{ staged: Map<string, string>; turns: number }> {
   const staged = new Map<string, string>();
-  const tools = memoryTools(input.memoryDir, staged);
+  const existing = new Set(input.existingIds ?? []);
+  const tools = memoryTools(input.memoryDir, staged, { existing, atCapacity: existing.size >= MAX_NOTES });
   const declarations = tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters as never }));
   const byName = new Map(tools.map(tool => [tool.name, tool]));
   const messages: Message[] = [{

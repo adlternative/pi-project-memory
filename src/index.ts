@@ -8,6 +8,7 @@ import { search } from "./search.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, MemoryModelError, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
 import { applyStaged, runForkExtraction } from "./fork-extraction.ts";
+import { MAX_NOTES } from "./model.ts";
 
 const MemorySchema = Type.Object({
   id: Type.String(), type: Type.Union(TYPES.map(type => Type.Literal(type))),
@@ -153,6 +154,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         const result = await runForkExtraction({
           model, modelRegistry: ctx.modelRegistry, memoryDir: memory.dir,
           evidence: input, index: snapshot.index, signal,
+          existingIds: snapshot.notes.map(note => note.id),
         });
         // Discard everything if the pass was cancelled: no partial notes.
         if (signal.aborted) return { status: "skipped", reason: "cancelled" };
@@ -190,9 +192,17 @@ export default function projectMemory(pi: ExtensionAPI) {
         pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "stale", trigger });
         return { status: "skipped", reason: "a newer turn started" };
       }
-      const saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal });
+      const saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal, skipWhenFull: true });
+      const dropped = drafts.filter(draft => !saved.some(note => note.id === draft.id)).length;
       // Lifecycle callbacks cannot append a public UsageEntry; expose separate bookkeeping instead.
-      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+      if (!saved.length && drafts.length) {
+        // At capacity with nothing updatable: record it as a skip, not a failure.
+        pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "capacity", mode, trigger, provider: response.provider, model: response.model, usage: response.usage });
+        if (ctx.hasUI) ctx.ui.notify(`Project memory is full (${snapshot.notes.length}/${MAX_NOTES}); new notes were skipped. Review /pmem list and forget obsolete notes.`, "warning");
+        // No checkpoint: the evidence stays eligible, so freeing a note lets the next pass retry.
+        return { status: "skipped", reason: "capacity" };
+      }
+      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), ...(dropped > 0 ? { dropped } : {}), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
       checkpoint();
       if (ctx.hasUI && saved.length) ctx.ui.notify(`Project memory: saved ${saved.length} note(s)`, "info");
       return { status: "ok", saved: saved.map(note => note.id) };
@@ -391,7 +401,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         return;
       }
       const state = await memory.read({ tolerant: true });
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");
