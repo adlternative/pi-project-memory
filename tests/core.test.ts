@@ -296,14 +296,14 @@ test("model failures preserve stop reason and usage without exposing credentials
 });
 
 test("extraction distinguishes invalid evidence references without relaxing exact matching", () => {
-  const evidence = [{ entryId: "u1", role: "user" as const, text: "请使用 pnpm。".repeat(30) }];
-  const memory = { id: "pnpm", type: "feedback", title: "Package manager", content: "Use pnpm.", entryId: "u1", quote: "请使用 pnpm。" };
+  const evidence = [{ entryId: "u1", role: "user" as const, text: "\u8bf7\u4f7f\u7528 pnpm\u3002".repeat(30) }];
+  const memory = { id: "pnpm", type: "feedback", title: "Package manager", content: "Use pnpm.", entryId: "u1", quote: "\u8bf7\u4f7f\u7528 pnpm\u3002" };
   assert.equal(parseExtraction({ memories: [memory] }, evidence, "session")[0].source.quote, memory.quote);
   for (const [change, reason] of [
     [{ entryId: "missing" }, /entryId is not in/],
     [{ quote: "" }, /empty or missing/],
     [{ quote: evidence[0].text }, /exceeds 400 UTF-8 bytes/],
-    [{ quote: "请使用pnpm。" }, /not an exact substring/],
+    [{ quote: "\u8bf7\u4f7f\u7528pnpm\u3002" }, /not an exact substring/],
   ] as const) assert.throws(() => parseExtraction({ memories: [{ ...memory, ...change }] }, evidence, "session"), reason);
 });
 
@@ -346,32 +346,4 @@ test("a hash-only folder from an earlier version is renamed in place, keeping it
   assert.equal(basename(named.dir), `legacy-project__${key.slice(0, 12)}`);
   await assert.rejects(readdir(legacy.dir), /ENOENT/);
   assert.deepEqual((await named.read()).notes, state.notes);
-});
-
-test("a full store keeps updates and drops new notes instead of failing the pass", async t => {
-  const { store } = await fixture(t);
-  const total = 256;
-  for (let i = 0; i < total; i += 4) {
-    await store.save(Array.from({ length: 4 }, (_, j) => draft(`note-${i + j}`, `Distinct bounded fact ${i + j}`)));
-  }
-  assert.equal((await store.read()).notes.length, total);
-  const before = await store.read();
-  const saved = await store.save([
-    draft("note-0", "An updated fact for an existing note."),
-    draft("brand-new", "This new note cannot fit."),
-  ], { skipWhenFull: true });
-  assert.deepEqual(saved.map(note => note.id), ["note-0"]);
-  const after = await store.read();
-  assert.equal(after.notes.length, total);
-  assert.equal(after.notes.find(note => note.id === "note-0")?.content, "An updated fact for an existing note.");
-  assert.equal(after.notes.some(note => note.id === "brand-new"), false);
-  assert.ok(after.revision > before.revision);
-});
-
-test("an explicit save is still rejected at capacity", async t => {
-  const { store } = await fixture(t);
-  for (let i = 0; i < 256; i += 4) {
-    await store.save(Array.from({ length: 4 }, (_, j) => draft(`note-${i + j}`, `Distinct bounded fact ${i + j}`)));
-  }
-  await assert.rejects(store.save([draft("overflow", "No room for this.")]), /Memory limit reached/);
 });

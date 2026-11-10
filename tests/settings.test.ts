@@ -179,3 +179,34 @@ test("settings defaults: extraction is on, tools are off, cadence is Claude Code
   assert.equal(parseMemorySettings({ autoExtract: false }).autoExtract, false);
   assert.equal(parseMemorySettings({ everyNTurns: 0 }).everyNTurns, 1);
 });
+
+test("/pmem compact reports exact duplicates and applies them only when asked", async t => {
+  const h = await makeHarness(t);
+  // Written directly, the way hand edits create duplicates that the save path would have merged.
+  for (const [id, content] of [["alpha", "Use pnpm in this repository."], ["beta", "Use pnpm in this repository."], ["gamma", "Reviews go to the payments group."]] as const) {
+    await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(h.store.dir, `${id}.md`), renderTopic({ ...note, id, content, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+  }
+  assert.equal((await h.store.read()).notes.length, 3);
+  await h.session.prompt("/pmem compact");
+  const report = lastReport(h);
+  assert.deepEqual(report.duplicates, [["alpha", "beta"]]);
+  assert.deepEqual(report.stale, []);
+  assert.equal(report.applied, 0);
+  assert.equal((await h.store.read()).notes.length, 3);
+
+  await h.session.prompt("/pmem compact apply");
+  const applied = lastReport(h);
+  assert.equal(applied.applied, 1);
+  const ids = (await h.store.read()).notes.map(item => item.id).sort();
+  assert.deepEqual(ids, ["alpha", "gamma"]);
+});
+
+test("/pmem status reports the index budget", async t => {
+  const h = await makeHarness(t);
+  await h.store.save([{ ...note, content: "Use pnpm in this repository.", source }]);
+  await h.session.prompt("/pmem");
+  const report = lastReport(h);
+  assert.equal(report.index.limit, 25000);
+  assert.ok(report.index.bytes > 0 && report.index.bytes < report.index.limit);
+});

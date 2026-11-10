@@ -3,8 +3,9 @@ import { homedir } from "node:os";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { clip, MemoryStore, projectIdentity, redact, TYPES, type Memory } from "./store.ts";
+import { clip, fingerprint, MemoryStore, projectIdentity, redact, TYPES, type Memory } from "./store.ts";
 import { search } from "./search.ts";
+import { INDEX_BYTES, INDEX_SOFT_RATIO } from "./markdown.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, MemoryModelError, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
 import { applyStaged, runForkExtraction } from "./fork-extraction.ts";
@@ -192,7 +193,16 @@ export default function projectMemory(pi: ExtensionAPI) {
         pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "stale", trigger });
         return { status: "skipped", reason: "a newer turn started" };
       }
-      const saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal, skipWhenFull: true });
+      let saved: Memory[];
+      try {
+        saved = await memory.save(drafts, { automatic: true, expectedRevision: snapshot.revision, signal, skipWhenFull: true });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/exceeds 25,000 UTF-8 bytes/.test(message)) throw error;
+        pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "index_full", mode, trigger });
+        if (ctx.hasUI) ctx.ui.notify("Project memory index is full; run /pmem compact, then forget or merge notes before new ones can be added.", "warning");
+        return { status: "skipped", reason: "index full" };
+      }
       const dropped = drafts.filter(draft => !saved.some(note => note.id === draft.id)).length;
       // Lifecycle callbacks cannot append a public UsageEntry; expose separate bookkeeping instead.
       if (!saved.length && drafts.length) {
@@ -202,9 +212,12 @@ export default function projectMemory(pi: ExtensionAPI) {
         // No checkpoint: the evidence stays eligible, so freeing a note lets the next pass retry.
         return { status: "skipped", reason: "capacity" };
       }
-      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), ...(dropped > 0 ? { dropped } : {}), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+      const after = await memory.read({ tolerant: true }).catch(() => undefined);
+      const indexBytes = Buffer.byteLength(after?.index ?? "");
+      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), ...(dropped > 0 ? { dropped } : {}), ...(indexBytes >= INDEX_BYTES * INDEX_SOFT_RATIO ? { indexNearLimit: true } : {}), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
       checkpoint();
       if (ctx.hasUI && saved.length) ctx.ui.notify(`Project memory: saved ${saved.length} note(s)`, "info");
+      if (ctx.hasUI && indexBytes >= INDEX_BYTES * INDEX_SOFT_RATIO) ctx.ui.notify(`Project memory index is at ${Math.round(indexBytes / INDEX_BYTES * 100)}% of ${INDEX_BYTES} bytes; merge or forget notes with /pmem compact.`, "warning");
       return { status: "ok", saved: saved.map(note => note.id) };
     } catch (error) {
       if (error instanceof MemoryModelError) {
@@ -401,13 +414,32 @@ export default function projectMemory(pi: ExtensionAPI) {
         return;
       }
       const state = await memory.read({ tolerant: true });
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      const indexBytes = Buffer.byteLength(state.index);
+      const index = { bytes: indexBytes, limit: INDEX_BYTES, percent: Math.round(indexBytes / INDEX_BYTES * 100) };
+      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");
         report({ notes: state.notes.slice(offset, offset + 10).map(({ id, type, title }) => ({ id, type, title })), nextOffset: offset + 10 < state.notes.length ? offset + 10 : null }); return;
       }
       if (action === "show") { const note = state.notes.find(note => note.id === value); if (!note) throw new Error("Memory not found"); report(note); return; }
+      if (action === "compact") {
+        // Local, no model call: exact duplicates plus stale notes, applied only when asked.
+        const groups = new Map<string, Memory[]>();
+        for (const note of state.notes) {
+          const digest = fingerprint(note.content);
+          groups.set(digest, [...(groups.get(digest) ?? []), note]);
+        }
+        const duplicates = [...groups.values()].filter(group => group.length > 1).map(group => group.map(note => note.id));
+        const stale = state.notes.filter(note => Date.now() - Date.parse(note.updatedAt) > 180 * 86_400_000).map(note => note.id);
+        let applied = 0;
+        if (value === "apply") {
+          for (const group of duplicates) for (const id of group.slice(1)) { await memory.forget(id); applied += 1; }
+        }
+        const after = applied ? await memory.read({ tolerant: true }) : state;
+        report({ index: { bytes: Buffer.byteLength(after.index), limit: INDEX_BYTES }, applied, duplicates, stale });
+        return;
+      }
       report("Use /pmem status | list [offset] | show <id> | forget <id> | auto on/off | extract");
     },
   });

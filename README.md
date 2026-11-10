@@ -182,6 +182,8 @@ Structured output is `{directory,indexPath,notes,truncated,nextOffset}`; each `n
 | `/pmem list [offset]` | Paginate the index |
 | `/pmem show <id>` | Content and provenance |
 | `/pmem forget <id>` | Delete the topic, drop its link, record a tombstone |
+| `/pmem compact` | Report exact duplicates and notes unused for 180 days, plus index usage |
+| `/pmem compact apply` | Delete the extra copies of exact duplicates |
 | `/pmem auto on\|off` | Toggle extraction for this session only |
 | `/pmem extract` | Run a pass now, synchronously |
 
@@ -209,7 +211,7 @@ Background extraction runs detached, so the turn settles immediately. Only one p
 
 | Resource | Limit |
 |---|---:|
-| Topics per project | 256 |
+| Topics per project | 1,024 (safety net; the index budget is the real limit) |
 | Title / description / body | 160 / 320 / 2,000 UTF-8 bytes |
 | Topic file including frontmatter | 4,096 bytes |
 | MEMORY.md | 25,000 bytes |
@@ -274,7 +276,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 ## Limitations
 
 - No consolidation pass, no team or cloud sync, no per-subagent store.
-- At the topic cap, extraction keeps updating existing notes and skips new ones (recording `dropped`); an explicit save is refused until you forget something.
+- The binding limit is the 25 KB index, as in Claude Code: near it the extension warns, and at it new notes are skipped with `index_full` until you compact or forget. The 1,024-topic cap is only a safety net.
 - `forget` is not privacy-grade erasure.
 - Fork-mode writes are applied file by file at the end, so a crash during that short window can still leave a subset written.
 - Developed and tested on macOS with Pi 1.2.0; Linux and Windows are unverified, as is power-loss durability.

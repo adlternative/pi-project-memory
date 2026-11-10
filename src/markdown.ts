@@ -3,6 +3,8 @@ import { clip, redact, validId, validateInput, type Memory, type MemoryInput } f
 export const INDEX_START = "<!-- pi-memory:index:start -->";
 export const INDEX_END = "<!-- pi-memory:index:end -->";
 export const INDEX_BYTES = 25_000;
+/** Claude Code reminds the model to tighten the index before it is actually full. */
+export const INDEX_SOFT_RATIO = 0.8;
 export const TOPIC_BYTES = 4096;
 
 function scalar(raw: string): string {

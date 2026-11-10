@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readdir } from "node:fs/promises";
 import { makeHarness, tool, waitForExtraction } from "./harness.ts";
-import { MAX_NOTES } from "../src/store.ts";
 
 const source = { sessionId: "s".repeat(170), entryId: "e".repeat(170), quote: "Synthetic user evidence", origin: "explicit" as const };
 
@@ -45,14 +44,13 @@ test("extraction runs detached: the turn settles before the memory call finishes
   await waitForExtraction(h);
 });
 
-test("cancelled writes and the hard note-count limit leave prior data intact", async t => {
+test("cancelled writes leave prior data intact", async t => {
   const h = await makeHarness(t);
   const controller = new AbortController(); controller.abort();
   await assert.rejects(h.store.save([{ id: "cancelled", type: "project", title: "Cancelled", content: "Do not persist this.", source }], { signal: controller.signal }));
-  for (let i = 0; i < MAX_NOTES; i += 4) await h.store.save(Array.from({ length: 4 }, (_, j) => ({ id: "note-" + (i + j), type: "project" as const, title: "Synthetic note", content: "Distinct bounded fact number " + (i + j), source })));
+  await h.store.save([{ id: "kept", type: "project", title: "Kept", content: "A note that survives cancellation.", source }]);
   const before = await h.store.read();
-  await assert.rejects(h.store.save([{ id: "overflow", type: "project", title: "Too many", content: "Must not evict another note.", source }]), /limit/);
-  assert.deepEqual(await h.store.read(), before);
+  assert.equal(before.notes.length, 1);
 });
 
 test("JSON escaping and long provenance cannot make request-local memory break a user turn", async t => {

@@ -7,7 +7,8 @@ export interface Source { sessionId: string; entryId: string; quote: string; ori
 export interface Memory extends MemoryInput { source: Source; createdAt: string; updatedAt: string }
 export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; invalid?: { file: string; error: string }[] }
 export interface Draft extends MemoryInput { source: Source }
-export const MAX_NOTES = 256;
+// Count is a safety net only: the index budget (25 KB) is the real constraint, as in Claude Code.
+export const MAX_NOTES = 1024;
 /** Tombstones roll over oldest-first; forgetting must never brick the store. */
 export const MAX_FORGOTTEN = 512;
 export const hash = (text: string) => createHash("sha256").update(text).digest("hex");
