@@ -250,3 +250,48 @@ test("/pmem dream consolidates updates and deletions in one pass", async t => {
   assert.deepEqual(state.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
   assert.equal(state.notes.find(item => item.id === "alpha")?.content, "Use pnpm, never npm.");
 });
+
+test("/pmem dream says there is nothing to consolidate on an empty store", async t => {
+  const h = await makeHarness(t, { settings: { projectMemory: { dream: true } } });
+  await h.session.prompt("/pmem dream");
+  const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
+  assert.ok(report && report.type === "custom_message", "expected a report");
+  assert.match(typeof report.content === "string" ? report.content : JSON.stringify(report.content), /Nothing to consolidate/);
+});
+
+test("dream shrinks its payload to fit the model input cap", async t => {
+  let seen = 0;
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true } },
+    answer: request => {
+      const text = JSON.stringify(request.context);
+      seen = Math.max(seen, Buffer.byteLength(text));
+      assert.ok(Buffer.byteLength(text) < 32_000, `dream payload was ${Buffer.byteLength(text)} bytes`);
+      return JSON.stringify({ updates: [], deletes: [], note: "nothing to change" });
+    },
+  });
+  const drafts = Array.from({ length: 70 }, (_, index) => ({
+    ...note,
+    id: `note-${index}`,
+    title: `Note ${index}`,
+    content: `Rule ${index}: ${"keep the workflow deterministic. ".repeat(20)}`,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`,
+  }));
+  for (const draft of drafts) {
+    await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(h.store.dir, `${draft.id}.md`), renderTopic({ ...draft, source }));
+  }
+  await h.session.prompt("/pmem dream");
+  const deadline = Date.now() + 20_000;
+  let entry;
+  while (Date.now() < deadline) {
+    entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.dream");
+    if (entry) break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.ok(entry && entry.type === "custom", "expected a dream entry");
+  assert.equal((entry.data as { status?: string }).status, "ok");
+  assert.ok(seen > 0, "the model should have been called");
+  assert.equal((await h.store.read()).notes.length, 70);
+});

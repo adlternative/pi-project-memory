@@ -266,6 +266,7 @@ export default function projectMemory(pi: ExtensionAPI) {
     idleTimer = timer;
   }
 
+  const DREAM_INPUT_BYTES = 24_000;
   const DREAM_PROMPT = `Consolidate this project's memory. Return JSON only: {"updates":[{"id":"existing-id","type":"...","title":"...","content":"..."}],"deletes":["existing-id"],"note":"one sentence"}
 
 Rules: ids must already exist - never invent one. Merge notes that say the same thing, keep the clearest title, move detail into the surviving note. Delete only notes that are wrong, obsolete, or fully covered elsewhere. Never delete more than a quarter of the notes. Do not add new memories; this pass only tightens what exists. Return empty arrays when nothing should change.`;
@@ -274,19 +275,28 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
    * Claude Code style dream: one consolidation pass over the existing notes, applied as one transaction.
    * Runs on a cadence (min hours AND min sessions) or on demand, never concurrently with another pass.
    */
-  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual"): Promise<{ updated: number; deleted: number } | undefined> {
-    if (!lifecycle) return undefined;
-    if (jobs.size) { trailing = true; return undefined; }
+  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual"): Promise<"started" | "empty" | "busy"> {
+    if (!lifecycle) return "busy";
+    if (jobs.size) { trailing = true; return "busy"; }
     const memory = await getStore(ctx);
     const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
-    if (!snapshot || snapshot.invalid || !snapshot.notes.length) return undefined;
+    if (!snapshot || snapshot.invalid || !snapshot.notes.length) return "empty";
     const { model, requested } = extractionModel(ctx);
-    const candidates = [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 60)
-      .map(note => ({ id: note.id, type: note.type, title: note.title, content: clip(note.content, 400) }));
+    // The model call rejects payloads over 32 KB, so fill that budget newest first instead of sending everything.
+    const candidates: { id: string; type: string; title: string; content: string }[] = [];
+    let budget = DREAM_INPUT_BYTES;
+    for (const note of [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
+      const item = { id: note.id, type: note.type, title: note.title, content: clip(note.content, 300) };
+      const size = Buffer.byteLength(JSON.stringify(item)) + 1;
+      if (size > budget) break;
+      budget -= size;
+      candidates.push(item);
+    }
+    if (!candidates.length) return "empty";
     const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(60_000)]);
     const job: Promise<void> = (async () => {
       try {
-        const { data, response } = await modelJSON(ctx, model, DREAM_PROMPT, { index: snapshot.index, notes: candidates }, signal);
+        const { data, response } = await modelJSON(ctx, model, DREAM_PROMPT, candidates, signal);
         const plan = record(data);
         if (Object.keys(plan).some(key => !["updates", "deletes", "note"].includes(key))) throw new Error("Unexpected field in dream plan");
         const updates = Array.isArray(plan.updates) ? plan.updates : [];
@@ -307,11 +317,11 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       } catch (error) {
         if (signal.aborted) return;
         pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, reason: clip(redact(error instanceof Error ? error.message : String(error)), 300) });
-        if (ctx.hasUI) ctx.ui.notify("Memory consolidation failed; notes are unchanged.", "warning");
+        if (ctx.hasUI) ctx.ui.notify(`Memory consolidation failed: ${clip(redact(error instanceof Error ? error.message : String(error)), 140)}. Notes are unchanged.`, "warning");
       }
     })().catch(() => {}).finally(() => { jobs.delete(job); if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); } });
     jobs.add(job);
-    return undefined;
+    return "started";
   }
 
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
@@ -485,8 +495,10 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       if (action === "show") { const note = state.notes.find(note => note.id === value); if (!note) throw new Error("Memory not found"); report(note); return; }
       if (action === "dream") {
         if (!enabled()) throw new Error("Memory is disabled for this process");
-        await runDream(ctx, "manual");
-        report("Memory consolidation requested; it runs in the background and records a pi-project-memory.dream entry.");
+        const outcome = await runDream(ctx, "manual");
+        if (outcome === "empty") report("Nothing to consolidate yet: no notes saved for this project.");
+        else if (outcome === "busy") report("Another memory pass is running; consolidation queued after it.");
+        else report("Consolidation started in the background; it records a pi-project-memory.dream entry.");
         return;
       }
       if (action === "compact") {
