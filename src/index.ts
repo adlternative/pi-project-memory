@@ -294,6 +294,8 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
     }
     if (!candidates.length) return "empty";
     const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(60_000)]);
+    const started = Date.now();
+    ctx.ui.setStatus("pmem-dream", `dreaming over ${candidates.length} notes`);
     const job: Promise<void> = (async () => {
       try {
         const { data, response } = await modelJSON(ctx, model, DREAM_PROMPT, candidates, signal);
@@ -308,18 +310,38 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
             source: { sessionId: ctx.sessionManager.getSessionId(), entryId: "dream", quote: clip(String(plan.note ?? "consolidation"), 400), origin: "extracted" as const },
           };
         });
-        const applied = drafts.length || deletes.length
-          ? await memory.consolidate(drafts, deletes, { expectedRevision: snapshot.revision, signal })
-          : { updated: 0, deleted: 0 };
-        pi.appendEntry("pi-project-memory.dream", { status: "ok", trigger, updated: applied.updated, deleted: applied.deleted, provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+        if (drafts.length || deletes.length) await memory.consolidate(drafts, deletes, { expectedRevision: snapshot.revision, signal });
+        const after = await memory.read({ tolerant: true });
+        const seconds = Math.max(1, Math.round((Date.now() - started) / 1000));
+        const summary = {
+          status: "ok" as const, trigger, seconds, notes: candidates.length,
+          updated: drafts.map(item => item.id), deleted: deletes, note: clip(String(plan.note ?? ""), 200) || undefined,
+          indexBefore: Buffer.byteLength(snapshot.index), indexAfter: Buffer.byteLength(after.index),
+          provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage,
+        };
+        pi.appendEntry("pi-project-memory.dream", summary);
         checkpoint();
-        if (ctx.hasUI && (applied.updated || applied.deleted)) ctx.ui.notify(`Memory consolidated: ${applied.updated} updated, ${applied.deleted} removed.`, "info");
+        const changed = drafts.length + deletes.length;
+        const lines = [
+          changed ? `**Dream done in ${seconds}s**: ${drafts.length} rewritten, ${deletes.length} removed.` : `**Dream done in ${seconds}s**: nothing worth changing.`,
+          changed ? `index ${summary.indexBefore} → ${summary.indexAfter} bytes` : "",
+          drafts.length ? `rewritten: ${drafts.map(item => `\`${item.id}\``).join(", ")}` : "",
+          deletes.length ? `removed: ${deletes.map(id => `\`${id}\``).join(", ")}` : "",
+          summary.note ? `_${summary.note}_` : "",
+        ].filter(Boolean);
+        report(lines.join("\n"));
+        if (ctx.hasUI && changed) ctx.ui.notify(`Dream: ${drafts.length} rewritten, ${deletes.length} removed.`, "info");
       } catch (error) {
         if (signal.aborted) return;
-        pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, reason: clip(redact(error instanceof Error ? error.message : String(error)), 300) });
-        if (ctx.hasUI) ctx.ui.notify(`Memory consolidation failed: ${clip(redact(error instanceof Error ? error.message : String(error)), 140)}. Notes are unchanged.`, "warning");
+        const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
+        pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, seconds: Math.max(1, Math.round((Date.now() - started) / 1000)), notes: candidates.length, reason });
+        report(`**Dream failed**: ${reason}. Notes are unchanged.`);
       }
-    })().catch(() => {}).finally(() => { jobs.delete(job); if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); } });
+    })().catch(() => {}).finally(() => {
+      ctx.ui.setStatus("pmem-dream", undefined);
+      jobs.delete(job);
+      if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
+    });
     jobs.add(job);
     return "started";
   }
@@ -457,10 +479,33 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
     },
   });
 
+  const SUBCOMMANDS: [string, string][] = [
+    ["status", "store size, index budget, dream cadence and the last pass"],
+    ["list [offset]", "notes ten per page"],
+    ["show <id>", "one note in full"],
+    ["forget <id>", "delete a note and keep it from coming back"],
+    ["auto on|off", "automatic extraction for this session"],
+    ["extract", "run extraction now"],
+    ["dream", "consolidate: merge, tighten, prune"],
+    ["compact", "report exact duplicates, stale notes and index usage"],
+    ["compact apply", "delete the extra copies of exact duplicates"],
+  ];
+  const help = ["**Project memory**", "", ...SUBCOMMANDS.map(([name, what]) => `- \`/pmem ${name}\` — ${what}`)].join("\n");
+
   pi.registerCommand("pmem", {
-    description: "Project memory: status | list [offset] | show <id> | forget <id> | auto on/off | extract | dream | compact [apply]",
+    description: "Project memory: status, list, show, forget, auto, extract, dream, compact",
+    getArgumentCompletions: prefix => {
+      const typed = prefix.trimStart();
+      const head = typed.split(/\s+/)[0] ?? "";
+      if (typed.includes(" ") && head === "compact") {
+        return typed.endsWith("apply") ? null : [{ value: "compact apply", label: "compact apply", description: SUBCOMMANDS[8][1] }];
+      }
+      return SUBCOMMANDS.filter(([name]) => name.startsWith(head) && !name.includes(" "))
+        .map(([name, description]) => ({ value: name, label: name, description }));
+    },
     handler: async (args, ctx) => {
-      const [action = "status", value] = args.trim().split(/\s+/);
+      const [action = "", value] = args.trim().split(/\s+/);
+      if (!action) { report(help); return; }
       if (action === "auto") {
         if (!enabled() || (value !== "on" && value !== "off")) throw new Error("Use /pmem auto on|off in an enabled session");
         auto = value === "on";
@@ -486,7 +531,9 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       const state = await memory.read({ tolerant: true });
       const indexBytes = Buffer.byteLength(state.index);
       const index = { bytes: indexBytes, limit: INDEX_BYTES, percent: Math.round(indexBytes / INDEX_BYTES * 100) };
-      if (action === "status" || !action) { report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, dream: { enabled: readSettings(pi).dream, minHours: readSettings(pi).dreamMinHours, minSessions: readSettings(pi).dreamMinSessions }, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile() }); return; }
+      if (action === "status" || !action) {
+        const lastDream = ctx.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "pi-project-memory.dream").at(-1);
+        report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, dream: { enabled: readSettings(pi).dream, minHours: readSettings(pi).dreamMinHours, minSessions: readSettings(pi).dreamMinSessions }, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile(), ...(lastDream && lastDream.type === "custom" ? { lastDream: lastDream.data } : {}) }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");
@@ -498,7 +545,7 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
         const outcome = await runDream(ctx, "manual");
         if (outcome === "empty") report("Nothing to consolidate yet: no notes saved for this project.");
         else if (outcome === "busy") report("Another memory pass is running; consolidation queued after it.");
-        else report("Consolidation started in the background; it records a pi-project-memory.dream entry.");
+        else report(`Dreaming over ${outcome === "started" ? "the newest notes" : "notes"}; the summary lands here when it finishes.`);
         return;
       }
       if (action === "compact") {

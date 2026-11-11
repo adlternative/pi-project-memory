@@ -21,7 +21,7 @@ test("settings decide the memory directory and expand a leading ~/", async t => 
   const name = `pi-memory-settings-test-${process.pid}`;
   const base = `~/${name}`;
   const h = await makeHarness(t, { useFlags: false, settings: { projectMemory: { directory: base } } });
-  await h.session.prompt("/pmem");
+  await h.session.prompt("/pmem status");
   const expected = h.store.dir.replace(h.memoryDir, join(homedir(), name));
   assert.equal(lastReport(h).directory, expected);
   // Reading config must not create anything in the home directory.
@@ -30,13 +30,13 @@ test("settings decide the memory directory and expand a leading ~/", async t => 
 
 test("a per-run flag still overrides the persisted setting", async t => {
   const h = await makeHarness(t, { settings: { projectMemory: { directory: join(homedir(), "ignored-dir") } } });
-  await h.session.prompt("/pmem");
+  await h.session.prompt("/pmem status");
   assert.equal(lastReport(h).directory, h.store.dir);
 });
 
 test("a relative settings directory is rejected instead of silently landing somewhere", async t => {
   const h = await makeHarness(t, { useFlags: false, settings: { projectMemory: { directory: "relative/memory" } } });
-  await h.session.prompt("/pmem");
+  await h.session.prompt("/pmem status");
   assert.deepEqual(h.session.messages.filter(message => message.role === "custom" && message.customType === "pi-project-memory.report"), []);
   await assert.rejects(readdir(join(h.cwd, "relative", "memory")), /ENOENT/);
 });
@@ -206,7 +206,7 @@ test("/pmem compact reports exact duplicates and applies them only when asked", 
 test("/pmem status reports the index budget", async t => {
   const h = await makeHarness(t);
   await h.store.save([{ ...note, content: "Use pnpm in this repository.", source }]);
-  await h.session.prompt("/pmem");
+  await h.session.prompt("/pmem status");
   const report = lastReport(h);
   assert.equal(report.index.limit, 25000);
   assert.ok(report.index.bytes > 0 && report.index.bytes < report.index.limit);
@@ -242,10 +242,11 @@ test("/pmem dream consolidates updates and deletions in one pass", async t => {
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   assert.ok(entry && entry.type === "custom", "expected a dream entry");
-  const data = entry.data as { status?: string; updated?: number; deleted?: number };
+  const data = entry.data as { status?: string; updated?: string[]; deleted?: string[]; indexBefore?: number; indexAfter?: number };
   assert.equal(data.status, "ok");
-  assert.equal(data.updated, 1);
-  assert.equal(data.deleted, 1);
+  assert.deepEqual(data.updated, ["alpha"]);
+  assert.deepEqual(data.deleted, ["beta"]);
+  assert.ok((data.indexAfter ?? Infinity) < (data.indexBefore ?? 0), "consolidation should shrink the index");
   const state = await h.store.read();
   assert.deepEqual(state.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
   assert.equal(state.notes.find(item => item.id === "alpha")?.content, "Use pnpm, never npm.");
@@ -294,4 +295,13 @@ test("dream shrinks its payload to fit the model input cap", async t => {
   assert.equal((entry.data as { status?: string }).status, "ok");
   assert.ok(seen > 0, "the model should have been called");
   assert.equal((await h.store.read()).notes.length, 70);
+});
+
+test("/pmem without arguments lists every subcommand", async t => {
+  const h = await makeHarness(t);
+  await h.session.prompt("/pmem");
+  const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
+  assert.ok(report && report.type === "custom_message", "expected a report");
+  const text = typeof report.content === "string" ? report.content : JSON.stringify(report.content);
+  for (const name of ["status", "list", "show", "forget", "auto", "extract", "dream", "compact"]) assert.match(text, new RegExp(`/pmem ${name}`));
 });
