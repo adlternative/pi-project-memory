@@ -187,7 +187,7 @@ Structured output is `{directory,indexPath,notes,truncated,nextOffset}`; each `n
 | `/pmem forget <id>` | Delete the topic, drop its link, record a tombstone |
 | `/pmem compact` | Report exact duplicates and notes unused for 180 days, plus index usage |
 | `/pmem compact apply` | Delete the extra copies of exact duplicates |
-| `/pmem dream` | Consolidate now: merge duplicates, tighten wording, delete what is obsolete; prints one summary line when done |
+| `/pmem dream` | Consolidate now: merge duplicates, tighten wording, delete what is obsolete. Runs synchronously and prints one summary line |
 | `/pmem auto on\|off` | Toggle extraction for this session only |
 | `/pmem extract` | Run a pass now, synchronously |
 

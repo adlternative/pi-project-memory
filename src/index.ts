@@ -275,12 +275,14 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
    * Claude Code style dream: one consolidation pass over the existing notes, applied as one transaction.
    * Runs on a cadence (min hours AND min sessions) or on demand, never concurrently with another pass.
    */
-  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual"): Promise<"started" | "empty" | "busy"> {
-    if (!lifecycle) return "busy";
-    if (jobs.size) { trailing = true; return "busy"; }
+  type DreamOutcome = { kind: "started" } | { kind: "empty" } | { kind: "busy" } | { kind: "finished"; text: string };
+
+  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual"): Promise<DreamOutcome> {
+    if (!lifecycle) return { kind: "busy" };
+    if (jobs.size) { trailing = true; return { kind: "busy" }; }
     const memory = await getStore(ctx);
     const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
-    if (!snapshot || snapshot.invalid || !snapshot.notes.length) return "empty";
+    if (!snapshot || snapshot.invalid || !snapshot.notes.length) return { kind: "empty" };
     const { model, requested } = extractionModel(ctx);
     // The model call rejects payloads over 32 KB, so fill that budget newest first instead of sending everything.
     const candidates: { id: string; type: string; title: string; content: string }[] = [];
@@ -292,10 +294,11 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       budget -= size;
       candidates.push(item);
     }
-    if (!candidates.length) return "empty";
+    if (!candidates.length) return { kind: "empty" };
     const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(60_000)]);
     const started = Date.now();
     ctx.ui.setStatus("pmem-dream", `dreaming over ${candidates.length} notes`);
+    let finished = "";
     const job: Promise<void> = (async () => {
       try {
         const { data, response } = await modelJSON(ctx, model, DREAM_PROMPT, candidates, signal);
@@ -329,13 +332,15 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
           deletes.length ? `removed: ${deletes.map(id => `\`${id}\``).join(", ")}` : "",
           summary.note ? `_${summary.note}_` : "",
         ].filter(Boolean);
-        report(lines.join("\n"));
+        finished = lines.join("\n");
+        if (trigger === "schedule") report(finished);
         if (ctx.hasUI && changed) ctx.ui.notify(`Dream: ${drafts.length} rewritten, ${deletes.length} removed.`, "info");
       } catch (error) {
         if (signal.aborted) return;
         const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
         pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, seconds: Math.max(1, Math.round((Date.now() - started) / 1000)), notes: candidates.length, reason });
-        report(`**Dream failed**: ${reason}. Notes are unchanged.`);
+        finished = `**Dream failed**: ${reason}. Notes are unchanged.`;
+        if (trigger === "schedule") report(finished);
       }
     })().catch(() => {}).finally(() => {
       ctx.ui.setStatus("pmem-dream", undefined);
@@ -343,7 +348,9 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
     });
     jobs.add(job);
-    return "started";
+    // A manual run waits and reports at the command; a scheduled run must not block the session.
+    if (trigger === "manual") { await job; return { kind: "finished", text: finished }; }
+    return { kind: "started" };
   }
 
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
@@ -543,9 +550,9 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       if (action === "dream") {
         if (!enabled()) throw new Error("Memory is disabled for this process");
         const outcome = await runDream(ctx, "manual");
-        if (outcome === "empty") report("Nothing to consolidate yet: no notes saved for this project.");
-        else if (outcome === "busy") report("Another memory pass is running; consolidation queued after it.");
-        else report(`Dreaming over ${outcome === "started" ? "the newest notes" : "notes"}; the summary lands here when it finishes.`);
+        if (outcome.kind === "empty") report("Nothing to consolidate yet: no notes saved for this project.");
+        else if (outcome.kind === "busy") report("Another memory pass is running; consolidation will run after it.");
+        else if (outcome.kind === "finished") report(outcome.text);
         return;
       }
       if (action === "compact") {

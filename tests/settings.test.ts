@@ -233,23 +233,21 @@ test("/pmem dream consolidates updates and deletions in one pass", async t => {
   }
   assert.equal((await h.store.read()).notes.length, 3);
 
+  // A manual dream is synchronous: the store and the summary are final when the command returns.
   await h.session.prompt("/pmem dream");
-  const deadline = Date.now() + 20_000;
-  let entry;
-  while (Date.now() < deadline) {
-    entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.dream");
-    if (entry) break;
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
+  const state = await h.store.read();
+  assert.deepEqual(state.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
+  assert.equal(state.notes.find(item => item.id === "alpha")?.content, "Use pnpm, never npm.");
+  const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
+  assert.ok(report && report.type === "custom_message", "expected a dream summary");
+  assert.match(typeof report.content === "string" ? report.content : JSON.stringify(report.content), /Dream done in \d+s/);
+  const entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.dream");
   assert.ok(entry && entry.type === "custom", "expected a dream entry");
   const data = entry.data as { status?: string; updated?: string[]; deleted?: string[]; indexBefore?: number; indexAfter?: number };
   assert.equal(data.status, "ok");
   assert.deepEqual(data.updated, ["alpha"]);
   assert.deepEqual(data.deleted, ["beta"]);
   assert.ok((data.indexAfter ?? Infinity) < (data.indexBefore ?? 0), "consolidation should shrink the index");
-  const state = await h.store.read();
-  assert.deepEqual(state.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
-  assert.equal(state.notes.find(item => item.id === "alpha")?.content, "Use pnpm, never npm.");
 });
 
 test("/pmem dream says there is nothing to consolidate on an empty store", async t => {
