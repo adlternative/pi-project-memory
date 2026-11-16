@@ -177,7 +177,7 @@ test("transaction paths, malformed topic data, invalid UTF-8 and note symlinks f
   await store.save([draft()]);
   const meta = await readFile(store.file, "utf8");
   const path = join(store.dir, "feedback_tools.md");
-  for (const body of ["missing frontmatter", markdown("x".repeat(5000)), Buffer.from([0xff, 0xfe, 0xff])]) {
+  for (const body of ["missing frontmatter", Buffer.from([0xff, 0xfe, 0xff])]) {
     await writeFile(path, body);
     await assert.rejects(store.read());
     assert.equal(await readFile(store.file, "utf8"), meta);

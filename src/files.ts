@@ -5,8 +5,8 @@ import { join, parse, relative, sep } from "node:path";
 import { hostname } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { TOPIC_BYTES } from "./markdown.ts";
 import { hash, MAX_NOTES, record, validId } from "./model.ts";
-import { INDEX_BYTES, TOPIC_BYTES } from "./markdown.ts";
 
 export interface FileText { text: string; hash: string; modifiedAt: string }
 export interface Change { name: string; before: string | null; after: string | null }
@@ -14,7 +14,9 @@ const MIB = 1024 * 1024;
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
 const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const allowed = (name: string) => ["MEMORY.md", ".state.json", "memories.json", ".legacy-memories.json", ".pending.json"].includes(name) || (name.endsWith(".md") && validId(name.slice(0, -3)));
-const limit = (name: string) => name === ".pending.json" ? 4 * MIB : name === "MEMORY.md" ? INDEX_BYTES : name.endsWith(".md") ? TOPIC_BYTES : MIB;
+const limit = (name: string) => name === ".pending.json" ? 4 * MIB : name === "MEMORY.md" ? 4 * MIB : name.endsWith(".md") ? TOPIC_BYTES : MIB;
+/** Reads tolerate an oversized note so one hand-edited file cannot make the store unreadable; writes stay strict. */
+const readLimit = (name: string) => name.endsWith(".md") && name !== "MEMORY.md" ? 4 * MIB : limit(name);
 
 // Waiting is only for a live owner; a suite running many writers in parallel can exceed a short budget.
 const LOCK_WAIT_MS = 10_000;
@@ -89,14 +91,14 @@ export class MemoryFiles {
     let before;
     try {
       before = await lstat(join(this.dir, name));
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > limit(name)) throw new Error(`Unsafe or oversized memory file: ${name}`);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > readLimit(name)) throw new Error(`Unsafe or oversized memory file: ${name}`);
       file = await open(join(this.dir, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     } catch (error) { if (missing(error)) return null; throw error; }
     try {
       const info = await file.stat();
-      if (!info.isFile() || info.nlink !== 1 || info.size > limit(name) || info.dev !== before.dev || info.ino !== before.ino) throw new Error(`Unsafe or changed memory file: ${name}`);
+      if (!info.isFile() || info.nlink !== 1 || info.size > readLimit(name) || info.dev !== before.dev || info.ino !== before.ino) throw new Error(`Unsafe or changed memory file: ${name}`);
       const bytes = await file.readFile();
-      if (bytes.length > limit(name)) throw new Error(`Oversized memory file: ${name}`);
+      if (bytes.length > readLimit(name)) throw new Error(`Oversized memory file: ${name}`);
       const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
       return { text, hash: hash(text), modifiedAt: info.mtime.toISOString() };
     } finally { await file.close(); }

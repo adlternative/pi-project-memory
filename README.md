@@ -281,6 +281,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 
 - No team or cloud sync, and no per-subagent store.
 - Consolidation (`dream`) is off by default. When on it runs once per `dreamMinHours` and `dreamMinSessions`, deletes at most a quarter of the notes in one pass, and records a `pi-project-memory.dream` entry.
+- A store stays readable even when a file breaks the limits: an oversized `MEMORY.md` is rebuilt down to the budget (dropping the oldest links, reported as `indexOmitted`), and a note body over 2,000 bytes is clamped in memory and reported as `truncated` instead of failing the whole store. The file on disk is left for you or an agent to repair.
 - The binding limit is the 25 KB index, as in Claude Code: near it the extension warns, and at it new notes are skipped with `index_full` until you compact or forget. The 1,024-topic cap is only a safety net.
 - `forget` is not privacy-grade erasure.
 - Fork-mode writes are applied file by file at the end, so a crash during that short window can still leave a subset written.

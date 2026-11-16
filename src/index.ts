@@ -207,6 +207,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         if (ctx.hasUI) ctx.ui.notify("Project memory index is full; run /pmem compact, then forget or merge notes before new ones can be added.", "warning");
         return { status: "skipped", reason: "index full" };
       }
+      if (snapshot.indexOmitted?.length) pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: [], indexOmitted: snapshot.indexOmitted.length });
       const dropped = drafts.filter(draft => !saved.some(note => note.id === draft.id)).length;
       // Lifecycle callbacks cannot append a public UsageEntry; expose separate bookkeeping instead.
       if (!saved.length && drafts.length) {
@@ -373,7 +374,7 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
     if (event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return;
     const target = await fileTarget(ctx, event.input.path);
     if (!target?.allowed || !target.memory) return;
-    try { await target.memory.read(); if (run) run.wrote = true; }
+    try { await target.memory.read({ strictNotes: true }); if (run) run.wrote = true; }
     catch { return { isError: true, content: [{ type: "text", text: "The Markdown edit is on disk but memory ingestion failed. Fix its flat frontmatter/content/size or resolve the store conflict. The edit was not silently rolled back." }] }; }
   });
 
@@ -540,7 +541,7 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       const index = { bytes: indexBytes, limit: INDEX_BYTES, percent: Math.round(indexBytes / INDEX_BYTES * 100) };
       if (action === "status" || !action) {
         const lastDream = ctx.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "pi-project-memory.dream").at(-1);
-        report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, dream: { enabled: readSettings(pi).dream, minHours: readSettings(pi).dreamMinHours, minSessions: readSettings(pi).dreamMinSessions }, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile(), ...(lastDream && lastDream.type === "custom" ? { lastDream: lastDream.data } : {}) }); return; }
+        report({ directory: memory.dir, count: state.notes.length, capacity: MAX_NOTES, ...(state.indexOmitted?.length ? { indexOmitted: state.indexOmitted.length } : {}), dream: { enabled: readSettings(pi).dream, minHours: readSettings(pi).dreamMinHours, minSessions: readSettings(pi).dreamMinSessions }, index, revision: state.revision, extractModel: readSettings(pi).extractModel, extractionMode: readSettings(pi).extractionMode, ...(state.invalid ? { invalid: state.invalid } : {}), enabled: enabled(), auto, persistent: !!ctx.sessionManager.getSessionFile(), ...(lastDream && lastDream.type === "custom" ? { lastDream: lastDream.data } : {}) }); return; }
       if (action === "list") {
         const offset = Number(value ?? 0);
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > state.notes.length) throw new Error("Invalid list offset");

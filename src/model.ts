@@ -5,10 +5,12 @@ export type MemoryType = (typeof TYPES)[number];
 export interface MemoryInput { id: string; type: MemoryType; title: string; description?: string; content: string }
 export interface Source { sessionId: string; entryId: string; quote: string; origin: "explicit" | "extracted" | "file" }
 export interface Memory extends MemoryInput { source: Source; createdAt: string; updatedAt: string }
-export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; invalid?: { file: string; error: string }[] }
+export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; indexOmitted?: string[]; truncated?: string[]; invalid?: { file: string; error: string }[] }
 export interface Draft extends MemoryInput { source: Source }
 // Count is a safety net only: the index budget (25 KB) is the real constraint, as in Claude Code.
 export const MAX_NOTES = 1024;
+/** Longest accepted note body; older stores and hand edits can exceed it. */
+export const CONTENT_BYTES = 2000;
 /** Tombstones roll over oldest-first; forgetting must never brick the store. */
 export const MAX_FORGOTTEN = 512;
 export const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -50,7 +52,7 @@ export function validateInput(value: unknown): MemoryInput {
   const id = text(item.id, 64);
   if (!validId(id) || !TYPES.includes(item.type as MemoryType)) throw new Error("Invalid memory id or type (memory is reserved for MEMORY.md)");
   const title = text(item.title, 160);
-  const content = text(item.content, 2000, true);
+  const content = text(item.content, CONTENT_BYTES, true);
   const description = item.description === undefined ? undefined : text(item.description, 320);
   const all = title + "\n" + (description ?? "") + "\n" + content;
   if (redact(all) !== all || all.includes("[REDACTED]")) throw new Error("Do not save credentials or redacted secrets");

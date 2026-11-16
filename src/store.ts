@@ -3,8 +3,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { lstat, realpath, rename } from "node:fs/promises";
 import { promisify } from "node:util";
 import { MemoryFiles, type Change, type FileText } from "./files.ts";
-import { parseTopic, renderIndex, renderTopic } from "./markdown.ts";
-import { clip, fingerprint, hash, legacyState, MAX_FORGOTTEN, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
+import { parseTopic, renderIndexFitted, renderTopic } from "./markdown.ts";
+import { clip, CONTENT_BYTES, fingerprint, hash, legacyState, MAX_FORGOTTEN, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
 export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInput } from "./model.ts";
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
 
@@ -12,7 +12,21 @@ interface Metadata { hash: string; contentHash: string; source: Source; createdA
 interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string; dream?: { lastAt: number; sessionsSince: number } }
 interface Loaded { state: State; disk: DiskState; metadata: FileText | null; index: FileText | null; documents: Map<string, FileText> }
 const emptyDisk = (): DiskState => ({ version: 2, revision: 0, records: {}, forgotten: [], indexHash: hash("") });
-const emptyState = (): State => ({ version: 2, revision: 0, notes: [], forgotten: [], index: renderIndex(null, []) });
+const emptyState = (): State => ({ version: 2, revision: 0, notes: [], forgotten: [], index: renderIndexFitted(null, []).text });
+/** Keeps frontmatter, trims the body to the accepted size. */
+function clampTopicBody(source: string, max: number): string {
+  const match = source.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
+  if (!match) return source;
+  return match[1] + clampBytes(match[2], max);
+}
+
+/** Cuts at a codepoint boundary so the result is still valid UTF-8 and parses as a note. */
+function clampBytes(text: string, max: number): string {
+  let out = text;
+  while (Buffer.byteLength(out) > max) out = out.slice(0, Math.floor(out.length * 0.9) - 1);
+  return out.replace(/[\uD800-\uDFFF]$/, "");
+}
+
 const noteMetadata = (note: Memory, digest: string): Metadata => ({ hash: digest, contentHash: fingerprint(note.content), source: note.source, createdAt: note.createdAt, updatedAt: note.updatedAt });
 
 function validateDisk(value: unknown): DiskState {
@@ -91,7 +105,7 @@ export class MemoryStore {
 
   private async persist(loaded: Loaded, notes: Memory[], forgotten: string[], edits: Map<string, string | null>, extras: Change[] = [], signal?: AbortSignal, dream = loaded.disk.dream) {
     if (notes.length > MAX_NOTES) throw new Error("Memory limit reached; review /pmem list and forget obsolete notes");
-    const index = renderIndex(loaded.index?.text ?? null, notes);
+    const { text: index } = renderIndexFitted(loaded.index?.text ?? null, notes);
     const records = Object.fromEntries([...notes].sort((a, b) => a.id.localeCompare(b.id)).map(note => {
       const name = `${note.id}.md`;
       const body = edits.has(name) ? edits.get(name) : loaded.documents.get(name)?.text;
@@ -119,12 +133,19 @@ export class MemoryStore {
     const notes: Memory[] = [];
     let forgotten = [...disk.forgotten];
     const invalid: { file: string; error: string }[] = [];
+    const truncated: string[] = [];
     for (const name of names) {
       let file: FileText | null, input;
       try {
         file = await this.files.read(name);
         if (!file) throw new Error(`Memory file changed during read: ${name}`);
-        input = parseTopic(name, file.text);
+        // A note over the body limit is clamped rather than rejected: one oversized file must not disable the store.
+        try { input = parseTopic(name, file.text); }
+        catch (error) {
+          if (!(error instanceof Error) || !/Invalid or oversized memory text/.test(error.message)) throw error;
+          input = parseTopic(name, clampTopicBody(file.text, CONTENT_BYTES));
+          truncated.push(name.replace(/\.md$/, ""));
+        }
       } catch (error) {
         if (!tolerant || legacy) throw error;
         invalid.push({ file: name, error: (error as Error).message });
@@ -139,7 +160,8 @@ export class MemoryStore {
     }
     for (const [id, prior] of Object.entries(disk.records)) if (!documents.has(`${id}.md`) && !invalid.some(item => item.file === `${id}.md`)) forgotten.push(id, prior.contentHash);
     forgotten = [...new Set(forgotten)].slice(-MAX_FORGOTTEN);
-    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: renderIndex(index?.text ?? null, notes), ...(invalid.length ? { invalid } : {}) };
+    const fitted = renderIndexFitted(index?.text ?? null, notes);
+    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: fitted.text, ...(fitted.omitted.length ? { indexOmitted: fitted.omitted } : {}), ...(invalid.length ? { invalid } : {}), ...(truncated.length ? { truncated } : {}) };
     const loaded: Loaded = { state, disk, metadata, index, documents };
     if (invalid.length) return loaded;
     if (legacy) {
@@ -175,7 +197,12 @@ export class MemoryStore {
   async read(options: { tolerant?: boolean } = {}): Promise<State> {
     await this.adoptLegacyDir();
     if (!await this.files.directory(false)) return emptyState();
-    return this.files.locked(async () => (await this.load(options.tolerant)).state);
+    return this.files.locked(async () => {
+      const { state } = await this.load(options.tolerant);
+      // File tools ask for the strict view so an oversized note is reported instead of silently clamped.
+      if (options.strictNotes && state.truncated?.length) throw new Error(`Oversized memory file: ${state.truncated[0]}.md`);
+      return state;
+    });
   }
 
   async save(drafts: Draft[], options: { automatic?: boolean; expectedRevision?: number; signal?: AbortSignal; skipWhenFull?: boolean } = {}): Promise<Memory[]> {

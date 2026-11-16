@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { renderTopic } from "../src/markdown.ts";
 import { promisify } from "node:util";
 import { MemoryStore, clip, hash, projectIdentity, projectKey, redact, type Draft, type Memory } from "../src/store.ts";
 import { search, tokenize } from "../src/search.ts";
@@ -376,4 +377,36 @@ test("dream counters advance per session and never create an unused store", asyn
   await store.save([draft()]);
   assert.deepEqual(await store.noteDreamSession(), { lastAt: 0, sessionsSince: 1 });
   assert.deepEqual(await store.noteDreamSession(), { lastAt: 0, sessionsSince: 2 });
+});
+
+test("an index that outgrew its budget still reads, writes and reports what it hides", async t => {
+  const { store } = await fixture(t);
+  // Written the way a hand edit or another tool leaves them: 500 notes, so the index cannot fit them all.
+  for (let index = 0; index < 500; index += 1) {
+    const id = `note-${String(index).padStart(3, "0")}`;
+    await mkdir(store.dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(store.dir, `${id}.md`), renderTopic({ ...draft(id, `Detail ${index}.`), title: `A deliberately long memory title that fills the index quickly ${index}`, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z` }));
+  }
+  const state = await store.read();
+  assert.equal(state.notes.length, 500);
+  assert.ok(Buffer.byteLength(state.index) <= 25_000, `index was ${Buffer.byteLength(state.index)} bytes`);
+  assert.ok((state.indexOmitted?.length ?? 0) > 0, "expected the index to report the links it had to drop");
+  await store.forget("note-000");
+  const after = await store.read();
+  assert.equal(after.notes.length, 499);
+});
+
+test("an oversized note file is clamped and healed instead of blocking the store", async t => {
+  const { store } = await fixture(t);
+  await store.save([draft("good", "Use pnpm.")]);
+  await mkdir(store.dir, { recursive: true, mode: 0o700 });
+  const big = { ...draft("big", "x".repeat(3000)), title: "Oversized note", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
+  await writeFile(join(store.dir, "big.md"), renderTopic(big));
+  const state = await store.read();
+  assert.deepEqual(state.notes.map(note => note.id).sort(), ["big", "good"]);
+  const clamped = state.notes.find(note => note.id === "big")!;
+  assert.ok(Buffer.byteLength(clamped.content) <= 2000);
+  assert.equal((await store.read()).notes.length, 2);
+  // Clamping stays in memory: the file on disk is left for the user or an agent to repair.
+  assert.ok((await readFile(join(store.dir, "big.md"), "utf8")).length > 3000);
 });
