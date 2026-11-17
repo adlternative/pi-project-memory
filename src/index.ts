@@ -157,7 +157,18 @@ export default function projectMemory(pi: ExtensionAPI) {
       pi.appendEntry("pi-project-memory.extraction", { status: "failed", reason });
       return { status: "failed", reason };
     }
-    const existing = [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 24).map(note => ({ id: note.id, type: note.type, title: note.title, content: clip(note.content, 160) }));
+    // Newest notes in full, up to 12 KB: an update replaces the whole note, so the model must have read it.
+    // Notes left out can still be matched by id, but an update to one is refused below.
+    const existing: { id: string; type: string; title: string; content: string }[] = [];
+    let noteBudget = 12_000;
+    for (const note of [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 24)) {
+      if (snapshot.truncated?.includes(note.id)) continue;
+      const item = { id: note.id, type: note.type, title: note.title, content: note.content };
+      const size = Buffer.byteLength(JSON.stringify(item));
+      if (size > noteBudget) break;
+      noteBudget -= size;
+      existing.push(item);
+    }
     const input = { evidence, existing, forgotten: snapshot.forgotten.filter(id => !id.startsWith("sha:")).slice(-128) };
     while (Buffer.byteLength(JSON.stringify(input)) > 30_000) {
       if (existing.length) existing.pop();
@@ -197,14 +208,21 @@ export default function projectMemory(pi: ExtensionAPI) {
     try {
       let answer = await modelJSON(ctx, model, EXTRACTION_PROMPT, input, signal);
       response = answer.response;
-      let { drafts, rejected } = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId());
+      // An update replaces the whole note, so it is refused for a note whose full text was not in the input.
+      const shown = new Set(existing.map(item => item.id));
+      const parse = (data: unknown) => {
+        const result = parseExtraction(data, evidence, ctx.sessionManager.getSessionId());
+        const blind = result.drafts.filter(draft => !shown.has(draft.id) && snapshot.notes.some(note => note.id === draft.id));
+        return { drafts: result.drafts.filter(draft => !blind.includes(draft)), rejected: [...result.rejected, ...blind.map(draft => `Update of ${draft.id} without its full text in the input`)] };
+      };
+      let { drafts, rejected } = parse(answer.data);
       // One retry when nothing survived because evidence references were wrong; other rejections are final.
       if (!drafts.length && rejected.some(reason => reason.startsWith("Ungrounded memory evidence:"))) {
         const priorUsage = response.usage;
         answer = await modelJSON(ctx, model, EXTRACTION_PROMPT + `\nThe previous attempt was rejected: ${rejected.join("; ")}. Correct the evidence references; omit unsupported memories.`, input, signal);
         response = answer.response;
         addUsage(response.usage, priorUsage);
-        ({ drafts, rejected } = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId()));
+        ({ drafts, rejected } = parse(answer.data));
       }
       // Every proposal was invalid: report the first reason, as a whole-batch failure did before.
       if (!drafts.length && rejected.length) throw new Error(rejected[0]);

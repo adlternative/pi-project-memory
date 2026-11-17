@@ -325,3 +325,33 @@ test("one invalid proposal no longer discards the valid one beside it", async t 
   assert.deepEqual(data.saved, ["package-manager"]);
   assert.deepEqual(data.rejected, ["Preferences require user evidence"]);
 });
+
+test("extraction sees existing notes in full and cannot overwrite one it was not shown", async t => {
+  const long = "Deploy steps: " + "check the canary, then the region, then the fleet. ".repeat(8);
+  let seen: { id: string; content: string }[] = [];
+  let target = "package-manager";
+  const h = await makeHarness(t, { auto: true, answer: request => {
+    if (request.kind !== "extract") return "Done.";
+    seen = request.data.existing;
+    const user = request.data.evidence.findLast((entry: any) => entry.role === "user");
+    return JSON.stringify({ memories: [{ id: target, type: "project", title: "Overwrite", content: "Short replacement.", entryId: user.entryId, quote: user.text }] });
+  } });
+  await h.store.save([{ id: "package-manager", type: "project", title: "Deploy", content: long, source: { sessionId: "s", entryId: "e", quote: "q", origin: "explicit" } }]);
+  await h.session.prompt("Remember the deploy order for this project.");
+  await waitForExtraction(h);
+  assert.equal(seen.find(item => item.id === "package-manager")?.content, long.trim(), "the model must receive the whole note, not a preview");
+
+  // A note pushed out of the input by newer notes can be named, but not overwritten.
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const filler = Array.from({ length: 30 }, (_, i) => ({ id: `filler-${i}`, type: "project" as const, title: `Filler ${i}`, content: `${i} ` + "y".repeat(1500), source: { sessionId: "s", entryId: "e", quote: "q", origin: "explicit" as const } }));
+  for (let i = 0; i < filler.length; i += 4) await h.store.save(filler.slice(i, i + 4));
+  assert.equal((await h.store.read()).notes.length, 31);
+  target = "package-manager";
+  await h.session.prompt("Also remember that rollbacks go region by region.");
+  await waitForExtraction(h);
+  assert.equal(seen.some(item => item.id === "package-manager"), false, "the old note no longer fits the input");
+  const entry = extractionEntries(h).at(-1)!.data as { status?: string; reason?: string };
+  assert.equal(entry.status, "failed");
+  assert.match(String(entry.reason), /without its full text/);
+  assert.equal((await h.store.read()).notes.find(item => item.id === "package-manager")?.content, "Short replacement.", "the first, informed update applied; the blind one did not");
+});

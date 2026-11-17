@@ -109,3 +109,20 @@ test("the sub-agent cannot add notes past capacity", async t => {
   const ok = await write.execute("2", { path: "package-manager.md", content: renderTopic(note) });
   assert.match(ok.content[0].text, /Staged package-manager.md/);
 });
+
+test("the sub-agent must read a note in full before overwriting it", async t => {
+  const root = await mkdtemp(resolve(".sandbox", "fork-read-first-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(root, "package-manager.md"), renderTopic(note));
+  await writeFile(join(root, "huge.md"), renderTopic({ ...note, id: "huge", content: "x".repeat(1900) }).replace("x".repeat(1900), "x".repeat(25_000)));
+  const staged = new Map<string, string>();
+  const [read, write] = memoryTools(root, staged);
+  await assert.rejects(write.execute("1", { path: "package-manager.md", content: renderTopic({ ...note, content: "Rewritten blind." }) }), /before overwriting/);
+  await read.execute("2", { path: "./package-manager.md" });
+  assert.match((await write.execute("3", { path: "package-manager.md", content: renderTopic({ ...note, content: "Rewritten after reading." }) })).content[0].text, /Staged/);
+  // A read clipped at 20 KB did not show the whole note, so it does not unlock an overwrite.
+  await read.execute("4", { path: "huge.md" });
+  await assert.rejects(write.execute("5", { path: "huge.md", content: renderTopic({ ...note, id: "huge", content: "Short." }) }), /before overwriting/);
+  assert.match((await write.execute("6", { path: "brand-new.md", content: renderTopic({ ...note, id: "brand-new" }) })).content[0].text, /Staged/, "new notes need no read");
+});

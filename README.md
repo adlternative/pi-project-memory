@@ -220,7 +220,7 @@ Background extraction runs detached, so the turn settles immediately. Only one p
 | Topic file including frontmatter | 4,096 bytes |
 | MEMORY.md | 25,000 bytes |
 | Tool output | 12,000 bytes |
-| Nested model input / output | 32,000 bytes (trimmed to 30,000; dream sends at most 12,000 of whole notes) / 32,000 text bytes; no memory-specific token cap, the model's own output limit applies |
+| Nested model input / output | 32,000 bytes (trimmed to 30,000; extraction and dream each send at most 12,000 bytes of whole notes) / 32,000 text bytes; no memory-specific token cap, the model's own output limit applies |
 | Extraction budget | 60 s, 12 messages, 1,000 bytes each, at most 4 notes |
 
 ## Safety
@@ -284,6 +284,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 - A store stays readable even when a file breaks the limits: an oversized `MEMORY.md` is rebuilt down to the budget (dropping the oldest links, reported as `indexOmitted`), and a note body over 2,000 bytes is clamped in memory and reported as `truncated` instead of failing the whole store. The file on disk is left for you or an agent to repair.
 - The binding limit is the 25 KB index, as in Claude Code: near it the extension warns once per session, and at it new notes are refused (extraction records `index_full`) while existing notes still update, until you dream, compact or forget. The 1,024-topic cap is only a safety net.
 - Extraction checks each proposed note on its own: an invalid one (for example a preference quoted from the assistant) is dropped and listed in the entry's `rejected`, and the valid ones are saved.
+- An update replaces a whole note, so the model must have read it in full first. Extraction sends the newest notes in full (up to 12 KB) and refuses updates to the others; in fork mode `write_memory` refuses to overwrite a note that `read_memory` has not returned in full.
 - After a provider quota error (qoder codes 110 and 112), automatic extraction and scheduled dream stop calling the provider until the next UTC midnight; `/pmem extract` and `/pmem dream` still try.
 - `forget` is not privacy-grade erasure.
 - Fork-mode writes are applied file by file at the end, so a crash during that short window can still leave a subset written.

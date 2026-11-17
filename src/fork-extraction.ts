@@ -27,6 +27,8 @@ function scopedPath(memoryDir: string, path: string): string {
 export interface ToolLimits { existing?: ReadonlySet<string>; atCapacity?: boolean }
 
 export function memoryTools(memoryDir: string, staged: Map<string, string>, limits: ToolLimits = {}): ScopedTool[] {
+  // Overwriting a note replaces all of it, so the sub-agent must have read the whole file first.
+  const read = new Set<string>();
   return [
     {
       name: "read_memory",
@@ -38,7 +40,9 @@ export function memoryTools(memoryDir: string, staged: Map<string, string>, limi
         const pending = staged.get(params.path);
         if (pending !== undefined) return { content: [{ type: "text" as const, text: clip(pending, 20_000) }], details: undefined };
         const { readFile } = await import("node:fs/promises");
-        const text = await readFile(scopedPath(memoryDir, params.path), "utf8").catch(() => null);
+        const target = scopedPath(memoryDir, params.path);
+        const text = await readFile(target, "utf8").catch(() => null);
+        if (text !== null && Buffer.byteLength(text) <= 20_000) read.add(target);
         return { content: [{ type: "text" as const, text: text === null ? `No file at ${params.path}` : clip(text, 20_000) }], details: undefined };
       },
     },
@@ -57,6 +61,9 @@ export function memoryTools(memoryDir: string, staged: Map<string, string>, limi
         if (limits.atCapacity && !limits.existing?.has(id) && !staged.has(params.path)) {
           throw new Error(`Memory is at capacity (${limits.existing?.size ?? 0} notes). Update an existing note instead of adding one.`);
         }
+        const { access } = await import("node:fs/promises");
+        const onDisk = await access(target).then(() => true, () => false);
+        if (onDisk && !read.has(target) && !staged.has(params.path)) throw new Error(`Read ${params.path} in full with read_memory before overwriting it`);
         parseTopic(params.path, params.content);
         staged.set(params.path, params.content);
         return { content: [{ type: "text" as const, text: `Staged ${params.path}` }], details: undefined };
@@ -67,7 +74,7 @@ export function memoryTools(memoryDir: string, staged: Map<string, string>, limi
 
 export const FORK_PROMPT = `You are the memory extraction sub-agent for this project. Update the Markdown memory files, then stop.
 
-Use read_memory to inspect the index and any note you may update. Use write_memory to create or overwrite a topic file with flat frontmatter (name, optional description, type, optional modified) and a concise body.
+Use read_memory to inspect the index and any note you may update. Use write_memory to create or overwrite a topic file with flat frontmatter (name, optional description, type, optional modified) and a concise body. Read an existing note before overwriting it, and keep every fact it already has.
 Rules: at most 4 changes; only durable, reusable facts (preferences, corrections, decisions with their reason, external references); never secrets; never one-off task state; update an existing note instead of duplicating; never write MEMORY.md.
 When nothing is worth saving, make no calls and reply exactly: Nothing to save.`;
 
