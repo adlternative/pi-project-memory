@@ -53,6 +53,9 @@ export interface MemorySettings {
 }
 export const DEFAULT_EXTRACT_MODEL = "qoder/fast";
 const EXTRACTION_TIMEOUT_MS = 60_000;
+/** Provider daily caps (qoder: 110 "Billing daily count exceeded", 112 pricing). Retrying the same day only repeats the error. */
+const QUOTA_ERROR = /Billing daily count exceeded|"code":"11[02]"/;
+const nextUtcMidnight = (now: number) => { const day = new Date(now); day.setUTCHours(24, 0, 0, 0); return day.getTime(); };
 
 /** Configuration lives in Pi settings so it survives installs, like CC's autoMemory* keys. */
 export function parseMemorySettings(section: unknown): MemorySettings {
@@ -98,6 +101,17 @@ export default function projectMemory(pi: ExtensionAPI) {
   let trailing = false;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let run: { prompt: string; wrote: boolean; attempted: boolean } | undefined;
+  // Automatic passes stop for the day after a quota error; manual commands still try. Per process.
+  let quotaPausedUntil = 0;
+  // Capacity warnings repeat every pass otherwise; show each kind once per session.
+  const warned = new Set<string>();
+  const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
+    if (!ctx.hasUI || warned.has(key)) return;
+    warned.add(key);
+    ctx.ui.notify(message, "warning");
+  };
+  const quotaPaused = (trigger: string) => trigger !== "manual" && Date.now() < quotaPausedUntil;
+  const noteQuota = (reason: string) => { if (QUOTA_ERROR.test(reason)) quotaPausedUntil = nextUtcMidnight(Date.now()); };
   const enabled = () => readSettings(pi).enabled && pi.getFlag("memory-disabled") !== true;
   const rootFor = (cwd: string) => {
     const flag = pi.getFlag("memory-dir");
@@ -133,6 +147,7 @@ export default function projectMemory(pi: ExtensionAPI) {
   /** Bounded no-tool extraction; retry invalid evidence once before rejecting the pass. */
   async function extractAndSave(ctx: ExtensionContext, signal: AbortSignal, leafAtStart: string | null, trigger: string): Promise<{ status: "ok" | "failed" | "skipped"; reason?: string; saved?: string[] }> {
     if (!enabled() || !ctx.sessionManager.getSessionFile() || signal.aborted) return { status: "skipped", reason: "disabled, ephemeral, or cancelled" };
+    if (quotaPaused(trigger)) return { status: "skipped", reason: "provider daily quota reached; automatic extraction resumes tomorrow" };
     const evidence = evidenceSinceCheckpoint(ctx);
     if (!evidence.some(entry => entry.role === "user" && entry.text.trim().length >= 4)) return { status: "skipped", reason: "no new user evidence" };
     const memory = await getStore(ctx);
@@ -172,6 +187,7 @@ export default function projectMemory(pi: ExtensionAPI) {
       } catch (error) {
         if (signal.aborted) return { status: "skipped", reason: "cancelled or timed out" };
         const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
+        noteQuota(reason);
         pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, trigger, reason, ...(requested ? { requestedModel: requested } : {}) });
         if (ctx.hasUI) ctx.ui.notify(`Project memory extraction failed: ${reason}.`, "warning");
         return { status: "failed", reason };
@@ -181,16 +197,17 @@ export default function projectMemory(pi: ExtensionAPI) {
     try {
       let answer = await modelJSON(ctx, model, EXTRACTION_PROMPT, input, signal);
       response = answer.response;
-      let drafts;
-      try { drafts = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId()); }
-      catch (error) {
-        if (!(error instanceof Error) || !error.message.startsWith("Ungrounded memory evidence:")) throw error;
+      let { drafts, rejected } = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId());
+      // One retry when nothing survived because evidence references were wrong; other rejections are final.
+      if (!drafts.length && rejected.some(reason => reason.startsWith("Ungrounded memory evidence:"))) {
         const priorUsage = response.usage;
-        answer = await modelJSON(ctx, model, EXTRACTION_PROMPT + `\nThe previous attempt was rejected: ${error.message}. Correct the evidence references; omit unsupported memories.`, input, signal);
+        answer = await modelJSON(ctx, model, EXTRACTION_PROMPT + `\nThe previous attempt was rejected: ${rejected.join("; ")}. Correct the evidence references; omit unsupported memories.`, input, signal);
         response = answer.response;
         addUsage(response.usage, priorUsage);
-        drafts = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId());
+        ({ drafts, rejected } = parseExtraction(answer.data, evidence, ctx.sessionManager.getSessionId()));
       }
+      // Every proposal was invalid: report the first reason, as a whole-batch failure did before.
+      if (!drafts.length && rejected.length) throw new Error(rejected[0]);
       if (signal.aborted) return { status: "skipped", reason: "cancelled" };
       // Claude Code abandons a pass once a newer turn started: the evidence is stale by then.
       if ((ctx.sessionManager.getLeafId() ?? null) !== leafAtStart) {
@@ -204,7 +221,7 @@ export default function projectMemory(pi: ExtensionAPI) {
         const message = error instanceof Error ? error.message : String(error);
         if (!/exceeds 25,000 UTF-8 bytes/.test(message)) throw error;
         pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "index_full", mode, trigger });
-        if (ctx.hasUI) ctx.ui.notify("Project memory index is full; run /pmem compact, then forget or merge notes before new ones can be added.", "warning");
+        warnOnce(ctx, "index_full", "Project memory index is full; new notes are skipped until you /pmem dream, /pmem compact or /pmem forget.");
         return { status: "skipped", reason: "index full" };
       }
       if (snapshot.indexOmitted?.length) pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: [], indexOmitted: snapshot.indexOmitted.length });
@@ -213,16 +230,16 @@ export default function projectMemory(pi: ExtensionAPI) {
       if (!saved.length && drafts.length) {
         // At capacity with nothing updatable: record it as a skip, not a failure.
         pi.appendEntry("pi-project-memory.extraction", { status: "skipped", reason: "capacity", mode, trigger, provider: response.provider, model: response.model, usage: response.usage });
-        if (ctx.hasUI) ctx.ui.notify(`Project memory is full (${snapshot.notes.length}/${MAX_NOTES}); new notes were skipped. Review /pmem list and forget obsolete notes.`, "warning");
+        warnOnce(ctx, "capacity", `Project memory is full (${snapshot.notes.length} notes); new notes are skipped until you /pmem dream, /pmem compact or /pmem forget.`);
         // No checkpoint: the evidence stays eligible, so freeing a note lets the next pass retry.
         return { status: "skipped", reason: "capacity" };
       }
       const after = await memory.read({ tolerant: true }).catch(() => undefined);
       const indexBytes = Buffer.byteLength(after?.index ?? "");
-      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), ...(dropped > 0 ? { dropped } : {}), ...(indexBytes >= INDEX_BYTES * INDEX_SOFT_RATIO ? { indexNearLimit: true } : {}), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
+      pi.appendEntry("pi-project-memory.extraction", { status: "ok", mode, trigger, saved: saved.map(note => note.id), ...(dropped > 0 ? { dropped } : {}), ...(rejected.length ? { rejected } : {}), ...(indexBytes >= INDEX_BYTES * INDEX_SOFT_RATIO ? { indexNearLimit: true } : {}), provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage });
       checkpoint();
       if (ctx.hasUI && saved.length) ctx.ui.notify(`Project memory: saved ${saved.length} note(s)`, "info");
-      if (ctx.hasUI && indexBytes >= INDEX_BYTES * INDEX_SOFT_RATIO) ctx.ui.notify(`Project memory index is at ${Math.round(indexBytes / INDEX_BYTES * 100)}% of ${INDEX_BYTES} bytes; merge or forget notes with /pmem compact.`, "warning");
+      if (indexBytes >= INDEX_BYTES * INDEX_SOFT_RATIO) warnOnce(ctx, "index_near", `Project memory index is at ${Math.round(indexBytes / INDEX_BYTES * 100)}% of ${INDEX_BYTES} bytes; /pmem dream or /pmem forget to make room.`);
       return { status: "ok", saved: saved.map(note => note.id) };
     } catch (error) {
       if (error instanceof MemoryModelError) {
@@ -232,8 +249,12 @@ export default function projectMemory(pi: ExtensionAPI) {
       }
       if (signal.aborted) return { status: "skipped", reason: "cancelled or timed out" };
       const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
-      pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, reason, ...(response ? { provider: response.provider, model: response.model, stopReason: response.stopReason, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
-      if (ctx.hasUI) ctx.ui.notify(`Project memory extraction failed: ${reason}. No notes changed. Retry /pmem extract after checking the provider/store.`, "warning");
+      const quota = QUOTA_ERROR.test(reason);
+      noteQuota(reason);
+      pi.appendEntry("pi-project-memory.extraction", { status: "failed", mode, reason, ...(quota ? { pausedUntil: new Date(quotaPausedUntil).toISOString() } : {}), ...(response ? { provider: response.provider, model: response.model, stopReason: response.stopReason, usage: response.usage } : {}), ...(requested ? { requestedModel: requested } : {}) });
+      if (ctx.hasUI) ctx.ui.notify(quota
+        ? "Project memory: the provider's daily quota is used up; automatic extraction is paused until tomorrow (UTC). /pmem extract still tries."
+        : `Project memory extraction failed: ${reason}. No notes changed. Retry /pmem extract after checking the provider/store.`, "warning");
       return { status: "failed", reason };
     }
   }
@@ -267,29 +288,44 @@ export default function projectMemory(pi: ExtensionAPI) {
     idleTimer = timer;
   }
 
-  const DREAM_INPUT_BYTES = 24_000;
+  // Whole notes in, rewritten notes out: keep the batch well under the 32 KB reply cap. Newest notes first.
+  const DREAM_INPUT_BYTES = 12_000;
   const DREAM_PROMPT = `Consolidate this project's memory. Return JSON only: {"updates":[{"id":"existing-id","type":"...","title":"...","content":"..."}],"deletes":["existing-id"],"note":"one sentence"}
 
-Rules: ids must already exist - never invent one. Merge notes that say the same thing, keep the clearest title, move detail into the surviving note. Delete only notes that are wrong, obsolete, or fully covered elsewhere. Never delete more than a quarter of the notes. Do not add new memories; this pass only tightens what exists. Return empty arrays when nothing should change.`;
+Rules: every note is given in full. Use only ids from this input - never invent one. Merge notes that say the same thing: keep the clearest title and move the other notes' details into the surviving note, then delete the others. Delete only notes that are wrong, obsolete, or fully covered by another note in this input. An update must keep every fact of the note it replaces and of the notes merged into it; never shorten a note by dropping detail, and never add facts that are not in the input. Never delete more than a quarter of the notes. Do not add new memories. Return empty arrays when nothing should change.`;
 
   /**
    * Claude Code style dream: one consolidation pass over the existing notes, applied as one transaction.
    * Runs on a cadence (min hours AND min sessions) or on demand, never concurrently with another pass.
    */
-  type DreamOutcome = { kind: "started" } | { kind: "empty" } | { kind: "busy" } | { kind: "finished"; text: string };
+  type DreamOutcome = { kind: "empty" } | { kind: "busy" } | { kind: "finished"; text: string };
 
-  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual"): Promise<DreamOutcome> {
+  async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual", claim?: { prior: { lastAt: number; sessionsSince: number }; at: number }): Promise<DreamOutcome> {
+    const memory = await getStore(ctx);
+    // A scheduled pass that never reaches the model (busy, empty, paused, aborted) hands its claim back.
+    let release = !!claim;
+    try { return await dreamPass(ctx, memory, trigger, () => { release = false; }); }
+    finally { if (release && claim) await memory.releaseDream(claim.prior, claim.at).catch(() => {}); }
+  }
+
+  async function dreamPass(ctx: ExtensionContext, memory: MemoryStore, trigger: "schedule" | "manual", settle: () => void): Promise<DreamOutcome> {
     if (!lifecycle) return { kind: "busy" };
     if (jobs.size) { trailing = true; return { kind: "busy" }; }
-    const memory = await getStore(ctx);
+    if (quotaPaused(trigger)) {
+      pi.appendEntry("pi-project-memory.dream", { status: "skipped", trigger, reason: "provider daily quota reached", pausedUntil: new Date(quotaPausedUntil).toISOString() });
+      return { kind: "busy" };
+    }
     const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
     if (!snapshot || snapshot.invalid || !snapshot.notes.length) return { kind: "empty" };
     const { model, requested } = extractionModel(ctx);
-    // The model call rejects payloads over 32 KB, so fill that budget newest first instead of sending everything.
+    // Whole notes only: the model rewrites what it sees, so a preview would come back as a truncated note.
+    // Clamped notes are skipped because their full text is not in memory. Fill the budget newest first.
     const candidates: { id: string; type: string; title: string; content: string }[] = [];
+    const clamped = new Set(snapshot.truncated ?? []);
     let budget = DREAM_INPUT_BYTES;
     for (const note of [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
-      const item = { id: note.id, type: note.type, title: note.title, content: clip(note.content, 300) };
+      if (clamped.has(note.id)) continue;
+      const item = { id: note.id, type: note.type, title: note.title, content: note.content };
       const size = Buffer.byteLength(JSON.stringify(item)) + 1;
       if (size > budget) break;
       budget -= size;
@@ -307,6 +343,10 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
         if (Object.keys(plan).some(key => !["updates", "deletes", "note"].includes(key))) throw new Error("Unexpected field in dream plan");
         const updates = Array.isArray(plan.updates) ? plan.updates : [];
         const deletes = Array.isArray(plan.deletes) ? plan.deletes.filter((id): id is string => typeof id === "string") : [];
+        // The plan may only touch notes the model saw in full in this pass.
+        const shown = new Set(candidates.map(item => item.id));
+        const outside = [...updates.map(item => String(record(item).id)), ...deletes].filter(id => !shown.has(id));
+        if (outside.length) throw new Error(`Dream plan touched notes outside this pass: ${outside.slice(0, 3).join(", ")}`);
         const drafts = updates.map(item => {
           const value = record(item);
           return {
@@ -324,6 +364,7 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
           provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage,
         };
         pi.appendEntry("pi-project-memory.dream", summary);
+        settle();
         checkpoint();
         const changed = drafts.length + deletes.length;
         const lines = [
@@ -339,6 +380,10 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       } catch (error) {
         if (signal.aborted) return;
         const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
+        noteQuota(reason);
+        // A pass that reached the model keeps the timer even when it failed: every session start retrying
+        // would burn the provider's quota. Only a pass that never ran hands the claim back.
+        settle();
         pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, seconds: Math.max(1, Math.round((Date.now() - started) / 1000)), notes: candidates.length, reason });
         finished = `**Dream failed**: ${reason}. Notes are unchanged.`;
         if (trigger === "schedule") report(finished);
@@ -349,9 +394,9 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
       if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
     });
     jobs.add(job);
-    // A manual run waits and reports at the command; a scheduled run must not block the session.
-    if (trigger === "manual") { await job; return { kind: "finished", text: finished }; }
-    return { kind: "started" };
+    // The caller decides whether to wait: /pmem dream reports at the command, session_start must not block.
+    await job;
+    return { kind: "finished", text: finished };
   }
 
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
@@ -379,19 +424,20 @@ Rules: ids must already exist - never invent one. Merge notes that say the same 
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    epoch++; clearIdle(); lifecycle?.abort(); lifecycle = new AbortController(); store = undefined; run = undefined; turnsSinceExtract = 0; trailing = false;
+    epoch++; clearIdle(); lifecycle?.abort(); lifecycle = new AbortController(); store = undefined; run = undefined; turnsSinceExtract = 0; trailing = false; warned.clear();
     const flag = pi.getFlag("memory-auto");
     auto = typeof flag === "boolean" ? flag : readSettings(pi).autoExtract;
     // Default parity with Claude Code and Codex: the memory directory is the interface, so tools are opt-in.
     if (!readSettings(pi).dedicatedTools) pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("pmem_")));
     const settings = readSettings(pi);
     if (!settings.enabled) return;
-    // Count this session synchronously so the cadence is deterministic, then consolidate in the background when due.
-    let dream = { lastAt: 0, sessionsSince: 0 };
-    try { dream = await (await getStore(ctx)).noteDreamSession(); } catch { return; }
-    const dueHours = dream.lastAt === 0 || Date.now() - dream.lastAt >= settings.dreamMinHours * 3_600_000;
-    if (!settings.dream || !dueHours || dream.sessionsSince < settings.dreamMinSessions) return;
-    await runDream(ctx, "schedule");
+    // Count this session, then claim and run a due pass in the background so the session starts immediately.
+    let memory: MemoryStore;
+    try { memory = await getStore(ctx); await memory.noteDreamSession(); } catch { return; }
+    if (!settings.dream) return;
+    const at = Date.now();
+    const prior = await memory.claimDream(settings.dreamMinHours, settings.dreamMinSessions, at).catch(() => null);
+    if (prior) void runDream(ctx, "schedule", { prior, at }).catch(() => {});
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     epoch++; run = undefined; store = undefined;

@@ -303,3 +303,94 @@ test("/pmem without arguments lists every subcommand", async t => {
   const text = typeof report.content === "string" ? report.content : JSON.stringify(report.content);
   for (const name of ["status", "list", "show", "forget", "auto", "extract", "dream", "compact"]) assert.match(text, new RegExp(`/pmem ${name}`));
 });
+
+test("dream sees whole notes and cannot touch a note it was not shown", async t => {
+  const long = "Rule: " + "keep every detail of the deployment checklist. ".repeat(12);
+  let shown: { id: string; content: string }[] = [];
+  let plan: unknown = { updates: [], deletes: [], note: "nothing" };
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true } },
+    answer: request => {
+      const text = JSON.stringify(request.context);
+      if (!text.includes("Consolidate this project's memory")) return "Done.";
+      const last = request.context.messages.findLast(message => message.role === "user");
+      const body = last && typeof last.content !== "string" ? last.content.map(part => part.type === "text" ? part.text : "").join("") : String(last?.content ?? "");
+      shown = JSON.parse(body);
+      return JSON.stringify(plan);
+    },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  await writeFile(join(h.store.dir, "checklist.md"), renderTopic({ ...note, id: "checklist", title: "Deploy checklist", content: long, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z" }));
+  await h.session.prompt("/pmem dream");
+  assert.equal(shown.find(item => item.id === "checklist")?.content, long.trim(), "dream must receive the full body, not a preview");
+
+  plan = { updates: [], deletes: ["not-shown"], note: "bad" };
+  await writeFile(join(h.store.dir, "other.md"), renderTopic({ ...note, id: "other", content: "Other note.", source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+  await h.session.prompt("/pmem dream");
+  const failed = h.manager.getEntries().filter(item => item.type === "custom" && item.customType === "pi-project-memory.dream").at(-1);
+  assert.ok(failed && failed.type === "custom");
+  assert.equal((failed.data as { status?: string }).status, "failed");
+  assert.match(String((failed.data as { reason?: string }).reason), /outside this pass/);
+  assert.equal((await h.store.read()).notes.length, 2);
+});
+
+test("a scheduled dream runs once per cadence, even when the pass fails", async t => {
+  let calls = 0;
+  let fail = true;
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 24 } },
+    answer: request => {
+      if (!JSON.stringify(request.context).includes("Consolidate this project's memory")) return "Done.";
+      calls += 1;
+      return fail ? { stopReason: "error", text: "HTTP 500: upstream unavailable" } : JSON.stringify({ updates: [], deletes: [], note: "nothing" });
+    },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  await writeFile(join(h.store.dir, "alpha.md"), renderTopic({ ...note, id: "alpha", content: "Use pnpm.", source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+  const dreams = () => h.manager.getEntries().flatMap(item => item.type === "custom" && item.customType === "pi-project-memory.dream" ? [item] : []);
+  const restart = () => h.session.extensionRunner.emit({ type: "session_start", reason: "startup" } as never);
+  const until = async (done: () => boolean) => { const deadline = Date.now() + 20_000; while (!done() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25)); };
+
+  await restart();
+  await until(() => dreams().length === 1);
+  assert.equal(calls, 1);
+  assert.equal((dreams()[0].data as { status?: string }).status, "failed");
+
+  // The failed pass reached the model, so it keeps the timer: other sessions do not retry today.
+  fail = false;
+  await restart();
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(calls, 1);
+
+  // /pmem dream ignores the cadence.
+  await h.session.prompt("/pmem dream");
+  assert.equal(calls, 2);
+  assert.equal((dreams().at(-1)!.data as { status?: string }).status, "ok");
+});
+
+test("a scheduled dream that never reached the model hands its claim back", async t => {
+  let dreamCalls = 0;
+  const h = await makeHarness(t, {
+    auto: true,
+    settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 24 } },
+    answer: request => {
+      if (request.kind === "extract") return { stopReason: "error", text: '{"code":"110","message":"Billing daily count exceeded"}' };
+      if (JSON.stringify(request.context).includes("Consolidate this project's memory")) dreamCalls += 1;
+      return "Done.";
+    },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  await writeFile(join(h.store.dir, "alpha.md"), renderTopic({ ...note, id: "alpha", content: "Use pnpm.", source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+  await h.session.prompt("Please prefer pnpm over npm for this project.");
+  await waitForExtraction(h);
+
+  // The quota error paused model calls, so the due pass is skipped and must stay due for a later session.
+  await h.session.extensionRunner.emit({ type: "session_start", reason: "startup" } as never);
+  const skipped = async () => h.manager.getEntries().some(item => item.type === "custom" && item.customType === "pi-project-memory.dream" && (item.data as { status?: string }).status === "skipped");
+  const deadline = Date.now() + 20_000;
+  while (!await skipped() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.ok(await skipped(), "expected a skipped dream entry");
+  assert.equal(dreamCalls, 0);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.ok(await h.store.claimDream(24, 1), "the skipped pass must leave the store due");
+});

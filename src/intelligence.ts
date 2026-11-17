@@ -58,7 +58,8 @@ export async function modelJSON(ctx: ExtensionContext, model: Model<Api> | undef
   }
   if (response.content.some(part => part.type === "toolCall")) throw new MemoryModelError("Memory model returned a tool call; only JSON text is allowed", response);
   const output = response.content.filter(part => part.type === "text").map(part => part.text).join("\n");
-  if (Buffer.byteLength(output) > 16_000) throw new MemoryModelError("Memory model output exceeds its hard cap", response);
+  // Same ceiling as the input: a consolidation reply echoes rewritten notes, so it can approach the input size.
+  if (Buffer.byteLength(output) > 32_000) throw new MemoryModelError("Memory model output exceeds its hard cap", response);
   try { return { data: JSON.parse(output) as unknown, response }; }
   catch { throw new MemoryModelError("Memory model returned invalid JSON", response); }
 }
@@ -73,24 +74,37 @@ Copy entryId from evidence, never from existing notes. The quote must be one con
 Return {"memories":[{"id":"lowercase-kebab-or-snake-id","type":"user|feedback|project|reference","title":"short title","content":"concise reusable note","entryId":"exact evidence id","quote":"exact evidence substring"}]}.
 Use an empty array if nothing is worth saving. Do not delete or rename existing notes.`;
 
-export function parseExtraction(value: unknown, evidence: Evidence[], sessionId: string): Draft[] {
+/**
+ * Validates every proposed memory on its own. A malformed reply still fails, but one bad item (an
+ * assistant-only preference, a loose quote, an oversized body) is dropped with its reason instead of
+ * discarding the good items in the same batch. Each check is as strict as before.
+ */
+export function parseExtraction(value: unknown, evidence: Evidence[], sessionId: string): { drafts: Draft[]; rejected: string[] } {
   const root = record(value);
-  if (Object.keys(root).some(key => key !== "memories") || !Array.isArray(root.memories) || root.memories.length > 4) throw new Error("Invalid extraction envelope");
+  if (Object.keys(root).some(key => key !== "memories") || !Array.isArray(root.memories)) throw new Error("Invalid extraction envelope");
   const ids = new Set<string>();
-  return root.memories.map(value => {
-    const item = record(value);
-    if (Object.keys(item).some(key => !["id", "type", "title", "description", "content", "entryId", "quote"].includes(key))) throw new Error("Unknown extraction field");
-    const memory = validateInput(item);
-    const entry = evidence.find(entry => entry.entryId === item.entryId);
-    if (!entry) throw new Error("Ungrounded memory evidence: entryId is not in the supplied evidence");
-    if (typeof item.quote !== "string" || !item.quote.trim()) throw new Error("Ungrounded memory evidence: quote is empty or missing");
-    if (Buffer.byteLength(item.quote) > 400) throw new Error("Ungrounded memory evidence: quote exceeds 400 UTF-8 bytes");
-    if (!entry.text.includes(item.quote)) throw new Error("Ungrounded memory evidence: quote is not an exact substring of the named entry");
-    if ((memory.type === "user" || memory.type === "feedback") && entry.role !== "user") throw new Error("Preferences require user evidence");
-    if (ids.has(memory.id)) throw new Error("Duplicate extraction ids");
-    ids.add(memory.id);
-    return { ...memory, source: { sessionId, entryId: entry.entryId, quote: item.quote, origin: "extracted" } };
-  });
+  const drafts: Draft[] = [];
+  const rejected: string[] = [];
+  for (const value of root.memories) {
+    try {
+      if (drafts.length >= 4) throw new Error("More than four memories in one pass");
+      const item = record(value);
+      if (Object.keys(item).some(key => !["id", "type", "title", "description", "content", "entryId", "quote"].includes(key))) throw new Error("Unknown extraction field");
+      const memory = validateInput(item);
+      const entry = evidence.find(entry => entry.entryId === item.entryId);
+      if (!entry) throw new Error("Ungrounded memory evidence: entryId is not in the supplied evidence");
+      if (typeof item.quote !== "string" || !item.quote.trim()) throw new Error("Ungrounded memory evidence: quote is empty or missing");
+      if (Buffer.byteLength(item.quote) > 400) throw new Error("Ungrounded memory evidence: quote exceeds 400 UTF-8 bytes");
+      if (!entry.text.includes(item.quote)) throw new Error("Ungrounded memory evidence: quote is not an exact substring of the named entry");
+      if ((memory.type === "user" || memory.type === "feedback") && entry.role !== "user") throw new Error("Preferences require user evidence");
+      if (ids.has(memory.id)) throw new Error("Duplicate extraction ids");
+      ids.add(memory.id);
+      drafts.push({ ...memory, source: { sessionId, entryId: entry.entryId, quote: item.quote, origin: "extracted" } });
+    } catch (error) {
+      rejected.push(clip(error instanceof Error ? error.message : String(error), 160));
+    }
+  }
+  return { drafts, rejected };
 }
 
 export async function semanticSearch(ctx: ExtensionContext, notes: Memory[], query: string, signal?: AbortSignal) {

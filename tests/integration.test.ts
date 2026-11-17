@@ -284,3 +284,44 @@ test("read-time fragments remain byte-bounded even with full multilingual notes"
   assert.ok(Buffer.byteLength(text) <= 6000);
   assert.deepEqual(h.errors, []);
 });
+
+test("a provider daily quota error pauses automatic extraction for the day but not /pmem extract", async t => {
+  let calls = 0;
+  const h = await makeHarness(t, { auto: true, answer: request => {
+    if (request.kind !== "extract") return "Done.";
+    calls += 1;
+    return { stopReason: "error", text: '{"code":"110","message":"Billing daily count exceeded"}' };
+  } });
+  await h.session.prompt("Please prefer pnpm over npm for this project.");
+  await waitForExtraction(h);
+  assert.equal(calls, 1);
+  const first = extractionEntries(h)[0].data as { status?: string; pausedUntil?: string };
+  assert.equal(first.status, "failed");
+  assert.ok(first.pausedUntil && Date.parse(first.pausedUntil) > Date.now(), "the failure records when automatic extraction resumes");
+
+  await h.session.prompt("Also always run the linter before committing.");
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(calls, 1, "automatic extraction must not call the provider again today");
+
+  await h.session.prompt("/pmem extract");
+  assert.equal(calls, 2, "an explicit /pmem extract still tries");
+});
+
+test("one invalid proposal no longer discards the valid one beside it", async t => {
+  const h = await makeHarness(t, { auto: true, answer: request => {
+    if (request.kind !== "extract") return "Use pnpm here.";
+    const user = request.data.evidence.findLast((entry: any) => entry.role === "user");
+    const assistant = request.data.evidence.findLast((entry: any) => entry.role === "assistant");
+    return JSON.stringify({ memories: [
+      { id: "guess", type: "feedback", title: "Guess", content: "Assistant-only preference.", entryId: assistant.entryId, quote: assistant.text },
+      { id: "package-manager", type: "feedback", title: "Package manager", content: "Use pnpm, not npm.", entryId: user.entryId, quote: user.text },
+    ] });
+  } });
+  await h.session.prompt("Please prefer pnpm over npm for this project.");
+  await waitForExtraction(h);
+  assert.deepEqual((await h.store.read()).notes.map(item => item.id), ["package-manager"]);
+  const data = extractionEntries(h)[0].data as { status?: string; saved?: string[]; rejected?: string[] };
+  assert.equal(data.status, "ok");
+  assert.deepEqual(data.saved, ["package-manager"]);
+  assert.deepEqual(data.rejected, ["Preferences require user evidence"]);
+});

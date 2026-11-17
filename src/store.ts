@@ -3,7 +3,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { lstat, realpath, rename } from "node:fs/promises";
 import { promisify } from "node:util";
 import { MemoryFiles, type Change, type FileText } from "./files.ts";
-import { parseTopic, renderIndexFitted, renderTopic } from "./markdown.ts";
+import { INDEX_BYTES, parseTopic, renderIndexFitted, renderTopic } from "./markdown.ts";
 import { clip, CONTENT_BYTES, fingerprint, hash, legacyState, MAX_FORGOTTEN, MAX_NOTES, record, timestamp, validId, validateForgotten, validateInput, validateSource, type Draft, type Memory, type Source, type State } from "./model.ts";
 export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInput } from "./model.ts";
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
@@ -194,7 +194,7 @@ export class MemoryStore {
   }
 
   /** Strict by default. tolerant skips broken topic files (listed in state.invalid) for read-only callers. */
-  async read(options: { tolerant?: boolean } = {}): Promise<State> {
+  async read(options: { tolerant?: boolean; strictNotes?: boolean } = {}): Promise<State> {
     await this.adoptLegacyDir();
     if (!await this.files.directory(false)) return emptyState();
     return this.files.locked(async () => {
@@ -231,10 +231,13 @@ export class MemoryStore {
         const note: Memory = { ...input, ...(description === undefined ? {} : { description }), id: existing?.id ?? input.id, createdAt: existing?.createdAt ?? now, updatedAt: now };
         if (existing) notes[notes.indexOf(existing)] = note;
         else {
-          if (notes.length >= MAX_NOTES) {
-            // Extractions drop new notes at capacity instead of discarding the whole batch (updates above still apply).
+          // The index budget is the real limit, the note cap a safety net. Reads tolerate an index that
+          // outgrew its budget; adding a note that would push a link out of the index is refused.
+          const full = notes.length >= MAX_NOTES ? "count" : renderIndexFitted(loaded.index?.text ?? null, [...notes, note]).omitted.length > renderIndexFitted(loaded.index?.text ?? null, notes).omitted.length ? "index" : undefined;
+          if (full) {
+            // Extractions drop new notes when full instead of discarding the whole batch (updates above still apply).
             if (options.skipWhenFull) continue;
-            throw new Error("Memory limit reached; review /pmem list and forget obsolete notes");
+            throw new Error(full === "count" ? "Memory limit reached; review /pmem list and forget obsolete notes" : `MEMORY.md exceeds ${INDEX_BYTES.toLocaleString("en-US")} UTF-8 bytes; forget or merge notes before adding more`);
           }
           notes.push(note);
         }
@@ -254,10 +257,40 @@ export class MemoryStore {
     return this.files.locked(async () => {
       const loaded = await this.load();
       const dream = { lastAt: loaded.disk.dream?.lastAt ?? 0, sessionsSince: (loaded.disk.dream?.sessionsSince ?? 0) + 1 };
-      const disk = { ...loaded.disk, dream };
-      await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify(disk, null, 2) + "\n" }]);
+      await this.writeDream(loaded, dream);
       return dream;
     });
+  }
+
+  /**
+   * Claims a scheduled pass when it is due, like Claude Code's .consolidate-lock: the timer moves under the
+   * store lock, so of many sessions starting together only one gets the claim. Returns the prior state for
+   * releaseDream, or null when not due or already claimed.
+   */
+  async claimDream(minHours: number, minSessions: number, now = Date.now()): Promise<{ lastAt: number; sessionsSince: number } | null> {
+    if (!await this.files.directory(false)) return null;
+    await this.adoptLegacyDir();
+    return this.files.locked(async () => {
+      const loaded = await this.load();
+      const prior = { lastAt: loaded.disk.dream?.lastAt ?? 0, sessionsSince: loaded.disk.dream?.sessionsSince ?? 0 };
+      if (prior.sessionsSince < minSessions || (prior.lastAt !== 0 && now - prior.lastAt < minHours * 3_600_000)) return null;
+      await this.writeDream(loaded, { lastAt: now, sessionsSince: 0 });
+      return prior;
+    });
+  }
+
+  /** Hands a failed pass's claim back so the next session retries instead of waiting out minHours. */
+  async releaseDream(prior: { lastAt: number; sessionsSince: number }, claimedAt: number): Promise<void> {
+    await this.files.locked(async () => {
+      const loaded = await this.load();
+      // A later claim or a finished pass owns the timer now.
+      if (loaded.disk.dream?.lastAt !== claimedAt) return;
+      await this.writeDream(loaded, { lastAt: prior.lastAt, sessionsSince: prior.sessionsSince + (loaded.disk.dream?.sessionsSince ?? 0) });
+    });
+  }
+
+  private async writeDream(loaded: Loaded, dream: { lastAt: number; sessionsSince: number }): Promise<void> {
+    await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream }, null, 2) + "\n" }]);
   }
 
   /** Applies a dream plan atomically: updates must exist, deletions are bounded and tombstoned. */
@@ -292,8 +325,7 @@ export class MemoryStore {
         deleted += 1;
       }
       const kept = notes.filter(note => !removals.includes(note.id));
-      const dream = { lastAt: Date.now(), sessionsSince: 0 };
-      await this.persist(loaded, kept, forgotten, edits, [], options.signal, dream);
+      await this.persist(loaded, kept, forgotten, edits, [], options.signal, { lastAt: Date.now(), sessionsSince: 0 });
       return { updated, deleted };
     }, options.signal);
   }

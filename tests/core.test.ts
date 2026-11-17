@@ -227,15 +227,23 @@ test("extraction validates evidence, role, duplicate ids, secret text and unknow
   const evidence = [{ entryId: "u1", role: "user" as const, text: "Always use pnpm, not npm." }, { entryId: "a1", role: "assistant" as const, text: "A speculative preference." }];
   const memory = { id: "pnpm", type: "feedback", title: "Package manager", content: "Use pnpm.", entryId: "u1", quote: "use pnpm" };
   const parsed = parseExtraction({ memories: [memory] }, evidence, "session");
-  assert.equal(parsed[0].source.origin, "extracted");
+  assert.equal(parsed.drafts[0].source.origin, "extracted");
+  assert.deepEqual(parsed.rejected, []);
   for (const item of [
     { ...memory, quote: "invented" },
     { ...memory, entryId: "absent" },
     { ...memory, entryId: "a1", quote: "speculative" },
     { ...memory, unexpected: true },
     { ...memory, content: "token=" + "x".repeat(30) },
-  ]) assert.throws(() => parseExtraction({ memories: [item] }, evidence, "session"));
-  assert.throws(() => parseExtraction({ memories: [memory, memory] }, evidence, "session"));
+  ]) {
+    // A bad item is dropped with its reason; the valid item beside it is kept.
+    const mixed = parseExtraction({ memories: [item, { ...memory, id: "kept" }] }, evidence, "session");
+    assert.deepEqual(mixed.drafts.map(draft => draft.id), ["kept"]);
+    assert.equal(mixed.rejected.length, 1);
+  }
+  assert.deepEqual(parseExtraction({ memories: [memory, memory] }, evidence, "session").rejected, ["Duplicate extraction ids"]);
+  assert.throws(() => parseExtraction({ memories: [memory], extra: true }, evidence, "session"), /Invalid extraction envelope/);
+  assert.throws(() => parseExtraction({ memory }, evidence, "session"), /Invalid extraction envelope/);
 });
 
 test("memory JSON calls explicitly disable hidden qoder/fast reasoning without changing other models", async () => {
@@ -299,13 +307,17 @@ test("model failures preserve stop reason and usage without exposing credentials
 test("extraction distinguishes invalid evidence references without relaxing exact matching", () => {
   const evidence = [{ entryId: "u1", role: "user" as const, text: "\u8bf7\u4f7f\u7528 pnpm\u3002".repeat(30) }];
   const memory = { id: "pnpm", type: "feedback", title: "Package manager", content: "Use pnpm.", entryId: "u1", quote: "\u8bf7\u4f7f\u7528 pnpm\u3002" };
-  assert.equal(parseExtraction({ memories: [memory] }, evidence, "session")[0].source.quote, memory.quote);
+  assert.equal(parseExtraction({ memories: [memory] }, evidence, "session").drafts[0].source.quote, memory.quote);
   for (const [change, reason] of [
     [{ entryId: "missing" }, /entryId is not in/],
     [{ quote: "" }, /empty or missing/],
     [{ quote: evidence[0].text }, /exceeds 400 UTF-8 bytes/],
     [{ quote: "\u8bf7\u4f7f\u7528pnpm\u3002" }, /not an exact substring/],
-  ] as const) assert.throws(() => parseExtraction({ memories: [{ ...memory, ...change }] }, evidence, "session"), reason);
+  ] as const) {
+    const result = parseExtraction({ memories: [{ ...memory, ...change }] }, evidence, "session");
+    assert.deepEqual(result.drafts, []);
+    assert.match(result.rejected[0], reason);
+  }
 });
 
 test("project folders are readable but the hash stays authoritative", async t => {
@@ -409,4 +421,47 @@ test("an oversized note file is clamped and healed instead of blocking the store
   assert.equal((await store.read()).notes.length, 2);
   // Clamping stays in memory: the file on disk is left for the user or an agent to repair.
   assert.ok((await readFile(join(store.dir, "big.md"), "utf8")).length > 3000);
+});
+
+test("a due dream is claimed by exactly one of many sessions and a failed pass hands it back", async t => {
+  const { store } = await fixture(t);
+  await store.save([draft("alpha", "Use pnpm.")]);
+  for (let i = 0; i < 5; i += 1) await store.noteDreamSession();
+  const at = Date.now();
+  const claims = await Promise.all(Array.from({ length: 6 }, () => store.claimDream(24, 5, at)));
+  const winners = claims.filter(Boolean);
+  assert.equal(winners.length, 1, "only one concurrent session may claim the pass");
+  assert.deepEqual(winners[0], { lastAt: 0, sessionsSince: 5 });
+  assert.equal(await store.claimDream(24, 5, at + 1000), null, "a claimed pass is not due again");
+
+  // A session that starts while the claimed pass runs is counted, and survives the release.
+  await store.noteDreamSession();
+  await store.releaseDream(winners[0]!, at);
+  assert.deepEqual(await store.claimDream(24, 5, at + 2000), { lastAt: 0, sessionsSince: 6 }, "a failed pass must leave the store due");
+  await assert.doesNotReject(store.releaseDream(winners[0]!, at), "a stale release must not undo a newer claim");
+  assert.equal(await store.claimDream(24, 5, at + 3000), null);
+});
+
+test("a full index refuses new notes but keeps updating existing ones", async t => {
+  const { store } = await fixture(t);
+  const make = (n: number) => ({ ...draft(`n-${String(n).padStart(3, "0")}`, `Body ${n}.`), type: "project" as const, title: `A deliberately long memory title that fills the index ${n}` });
+  let saved = 0;
+  await assert.rejects(async () => { for (; saved < 600; saved += 1) await store.save([make(saved)]); }, /MEMORY\.md exceeds 25,000 UTF-8 bytes/);
+  const full = await store.read();
+  assert.equal(full.notes.length, saved);
+  assert.equal(full.indexOmitted, undefined, "every saved note must stay linked from the index");
+  assert.deepEqual(await store.save([make(900)], { skipWhenFull: true }), [], "extraction skips new notes when the index is full");
+  assert.equal((await store.save([{ ...make(0), content: "Updated while full." }]))[0].content, "Updated while full.");
+  assert.equal((await store.read()).notes.length, saved);
+});
+
+test("a model reply between 16 and 32 KB is accepted and a larger one is refused", async () => {
+  const model = { provider: "memory-test", id: "synthetic" } as NonNullable<Parameters<typeof modelJSON>[1]>;
+  let size = 20_000;
+  const ctx = { modelRegistry: { streamSimple: () => ({ result: async () => ({
+    stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ updates: [{ id: "a", content: "x".repeat(size) }], deletes: [], note: "" }) }], usage: {},
+  }) }) } } as unknown as Parameters<typeof modelJSON>[0];
+  assert.ok((await modelJSON(ctx, model, "Consolidate", {})).data, "a full consolidation reply must fit");
+  size = 40_000;
+  await assert.rejects(modelJSON(ctx, model, "Consolidate", {}), /output exceeds its hard cap/);
 });
