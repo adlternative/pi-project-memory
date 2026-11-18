@@ -126,3 +126,19 @@ test("the sub-agent must read a note in full before overwriting it", async t => 
   await assert.rejects(write.execute("5", { path: "huge.md", content: renderTopic({ ...note, id: "huge", content: "Short." }) }), /before overwriting/);
   assert.match((await write.execute("6", { path: "brand-new.md", content: renderTopic({ ...note, id: "brand-new" }) })).content[0].text, /Staged/, "new notes need no read");
 });
+
+test("a provider error in fork extraction fails the pass instead of reading as nothing to save", async t => {
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { autoExtract: true, extractionMode: "fork", everyNTurns: 1 } },
+    answer: request => (JSON.stringify(request.context).includes("memory extraction sub-agent")
+      ? { stopReason: "error", text: '{"code":"110","message":"Billing daily count exceeded"}' }
+      : "Done."),
+  });
+  await h.session.prompt("We prefer pnpm over npm for future work in this repository.");
+  await waitForExtraction(h);
+  const entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.extraction");
+  assert.ok(entry && entry.type === "custom");
+  const data = entry.data as { status?: string; reason?: string };
+  assert.equal(data.status, "failed");
+  assert.match(String(data.reason), /Billing daily count exceeded/);
+});

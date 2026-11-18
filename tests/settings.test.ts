@@ -220,79 +220,12 @@ test("dream defaults are off with Claude Code's cadence", async () => {
   assert.equal(defaults.dreamMinSessions, 5);
 });
 
-test("/pmem dream consolidates updates and deletions in one pass", async t => {
-  const h = await makeHarness(t, {
-    settings: { projectMemory: { dream: true } },
-    answer: request => (JSON.stringify(request.context).includes("Consolidate this project's memory")
-      ? JSON.stringify({ updates: [{ id: "alpha", type: "feedback", title: "Package manager", content: "Use pnpm, never npm." }], deletes: ["beta"], note: "merged alpha and beta" })
-      : "Done."),
-  });
-  for (const [id, content] of [["alpha", "Use pnpm."], ["beta", "Use pnpm in this repo."], ["gamma", "Reviews go to the payments group."]] as const) {
-    await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
-    await writeFile(join(h.store.dir, `${id}.md`), renderTopic({ ...note, id, content, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
-  }
-  assert.equal((await h.store.read()).notes.length, 3);
-
-  // A manual dream is synchronous: the store and the summary are final when the command returns.
-  await h.session.prompt("/pmem dream");
-  const state = await h.store.read();
-  assert.deepEqual(state.notes.map(item => item.id).sort(), ["alpha", "gamma"]);
-  assert.equal(state.notes.find(item => item.id === "alpha")?.content, "Use pnpm, never npm.");
-  const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
-  assert.ok(report && report.type === "custom_message", "expected a dream summary");
-  assert.match(typeof report.content === "string" ? report.content : JSON.stringify(report.content), /Dream done in \d+s/);
-  const entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.dream");
-  assert.ok(entry && entry.type === "custom", "expected a dream entry");
-  const data = entry.data as { status?: string; updated?: string[]; deleted?: string[]; indexBefore?: number; indexAfter?: number };
-  assert.equal(data.status, "ok");
-  assert.deepEqual(data.updated, ["alpha"]);
-  assert.deepEqual(data.deleted, ["beta"]);
-  assert.ok((data.indexAfter ?? Infinity) < (data.indexBefore ?? 0), "consolidation should shrink the index");
-});
-
 test("/pmem dream says there is nothing to consolidate on an empty store", async t => {
   const h = await makeHarness(t, { settings: { projectMemory: { dream: true } } });
   await h.session.prompt("/pmem dream");
   const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
   assert.ok(report && report.type === "custom_message", "expected a report");
   assert.match(typeof report.content === "string" ? report.content : JSON.stringify(report.content), /Nothing to consolidate/);
-});
-
-test("dream shrinks its payload to fit the model input cap", async t => {
-  let seen = 0;
-  const h = await makeHarness(t, {
-    settings: { projectMemory: { dream: true } },
-    answer: request => {
-      const text = JSON.stringify(request.context);
-      seen = Math.max(seen, Buffer.byteLength(text));
-      assert.ok(Buffer.byteLength(text) < 32_000, `dream payload was ${Buffer.byteLength(text)} bytes`);
-      return JSON.stringify({ updates: [], deletes: [], note: "nothing to change" });
-    },
-  });
-  const drafts = Array.from({ length: 70 }, (_, index) => ({
-    ...note,
-    id: `note-${index}`,
-    title: `Note ${index}`,
-    content: `Rule ${index}: ${"keep the workflow deterministic. ".repeat(20)}`,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: `2026-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`,
-  }));
-  for (const draft of drafts) {
-    await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
-    await writeFile(join(h.store.dir, `${draft.id}.md`), renderTopic({ ...draft, source }));
-  }
-  await h.session.prompt("/pmem dream");
-  const deadline = Date.now() + 20_000;
-  let entry;
-  while (Date.now() < deadline) {
-    entry = h.manager.getEntries().find(item => item.type === "custom" && item.customType === "pi-project-memory.dream");
-    if (entry) break;
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
-  assert.ok(entry && entry.type === "custom", "expected a dream entry");
-  assert.equal((entry.data as { status?: string }).status, "ok");
-  assert.ok(seen > 0, "the model should have been called");
-  assert.equal((await h.store.read()).notes.length, 70);
 });
 
 test("/pmem without arguments lists every subcommand", async t => {
@@ -304,45 +237,15 @@ test("/pmem without arguments lists every subcommand", async t => {
   for (const name of ["status", "list", "show", "forget", "auto", "extract", "dream", "compact"]) assert.match(text, new RegExp(`/pmem ${name}`));
 });
 
-test("dream sees whole notes and cannot touch a note it was not shown", async t => {
-  const long = "Rule: " + "keep every detail of the deployment checklist. ".repeat(12);
-  let shown: { id: string; content: string }[] = [];
-  let plan: unknown = { updates: [], deletes: [], note: "nothing" };
-  const h = await makeHarness(t, {
-    settings: { projectMemory: { dream: true } },
-    answer: request => {
-      const text = JSON.stringify(request.context);
-      if (!text.includes("Consolidate this project's memory")) return "Done.";
-      const last = request.context.messages.findLast(message => message.role === "user");
-      const body = last && typeof last.content !== "string" ? last.content.map(part => part.type === "text" ? part.text : "").join("") : String(last?.content ?? "");
-      shown = JSON.parse(body);
-      return JSON.stringify(plan);
-    },
-  });
-  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
-  await writeFile(join(h.store.dir, "checklist.md"), renderTopic({ ...note, id: "checklist", title: "Deploy checklist", content: long, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z" }));
-  await h.session.prompt("/pmem dream");
-  assert.equal(shown.find(item => item.id === "checklist")?.content, long.trim(), "dream must receive the full body, not a preview");
-
-  plan = { updates: [], deletes: ["not-shown"], note: "bad" };
-  await writeFile(join(h.store.dir, "other.md"), renderTopic({ ...note, id: "other", content: "Other note.", source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
-  await h.session.prompt("/pmem dream");
-  const failed = h.manager.getEntries().filter(item => item.type === "custom" && item.customType === "pi-project-memory.dream").at(-1);
-  assert.ok(failed && failed.type === "custom");
-  assert.equal((failed.data as { status?: string }).status, "failed");
-  assert.match(String((failed.data as { reason?: string }).reason), /outside this pass/);
-  assert.equal((await h.store.read()).notes.length, 2);
-});
-
 test("a scheduled dream runs once per cadence, even when the pass fails", async t => {
   let calls = 0;
   let fail = true;
   const h = await makeHarness(t, {
     settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 24 } },
     answer: request => {
-      if (!JSON.stringify(request.context).includes("Consolidate this project's memory")) return "Done.";
+      if (!JSON.stringify(request.context).includes("Dream: consolidate this project")) return "Done.";
       calls += 1;
-      return fail ? { stopReason: "error", text: "HTTP 500: upstream unavailable" } : JSON.stringify({ updates: [], deletes: [], note: "nothing" });
+      return fail ? { stopReason: "error", text: "HTTP 500: upstream unavailable" } : "Nothing to consolidate.";
     },
   });
   await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
@@ -375,7 +278,7 @@ test("a scheduled dream that never reached the model hands its claim back", asyn
     settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 24 } },
     answer: request => {
       if (request.kind === "extract") return { stopReason: "error", text: '{"code":"110","message":"Billing daily count exceeded"}' };
-      if (JSON.stringify(request.context).includes("Consolidate this project's memory")) dreamCalls += 1;
+      if (JSON.stringify(request.context).includes("Dream: consolidate this project")) dreamCalls += 1;
       return "Done.";
     },
   });
@@ -395,38 +298,12 @@ test("a scheduled dream that never reached the model hands its claim back", asyn
   assert.ok(await h.store.claimDream(24, 1), "the skipped pass must leave the store due");
 });
 
-test("repeated /pmem dream moves through the store instead of rereading the newest notes", async t => {
-  const batches: string[][] = [];
-  const h = await makeHarness(t, {
-    settings: { projectMemory: { dream: true } },
-    answer: request => {
-      if (!JSON.stringify(request.context).includes("Consolidate this project's memory")) return "Done.";
-      const last = request.context.messages.findLast(message => message.role === "user");
-      const body = last && typeof last.content !== "string" ? last.content.map(part => part.type === "text" ? part.text : "").join("") : String(last?.content ?? "");
-      batches.push((JSON.parse(body) as { id: string }[]).map(item => item.id));
-      return JSON.stringify({ updates: [], deletes: [], note: "nothing" });
-    },
-  });
-  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
-  for (let i = 0; i < 40; i += 1) {
-    const id = `note-${String(i).padStart(2, "0")}`;
-    await writeFile(join(h.store.dir, `${id}.md`), renderTopic({ ...note, id, title: `Topic ${i}`, content: `Rule ${i}: ${"keep this workflow detail. ".repeat(30)}`, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: `2026-01-01T00:${String(i).padStart(2, "0")}:00.000Z` }));
-  }
-  for (let pass = 0; pass < 6 && new Set(batches.flat()).size < 40; pass += 1) await h.session.prompt("/pmem dream");
-  assert.ok(batches.length >= 2, "expected several passes");
-  assert.notDeepEqual(batches[1], batches[0], "the second pass must not resend the first batch");
-  assert.equal(new Set(batches.flat()).size, 40, "repeated passes must reach every note");
-  const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
-  assert.ok(report && report.type === "custom_message");
-  assert.match(typeof report.content === "string" ? report.content : JSON.stringify(report.content), /reviewed (\d+ of 40 notes|all 40 notes)/);
-});
-
 test("an ephemeral session neither counts toward nor runs a scheduled dream", async t => {
   let calls = 0;
   const h = await makeHarness(t, {
     persistent: false,
     settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 0 } },
-    answer: request => { if (JSON.stringify(request.context).includes("Consolidate this project's memory")) calls += 1; return "Done."; },
+    answer: request => { if (JSON.stringify(request.context).includes("Dream: consolidate this project")) calls += 1; return "Done."; },
   });
   await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
   await writeFile(join(h.store.dir, "alpha.md"), renderTopic({ ...note, id: "alpha", content: "Use pnpm.", source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));

@@ -1,10 +1,10 @@
 import { isAbsolute, relative, resolve } from "node:path";
-import type { Api, Message, Model, ToolCall } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseTopic } from "./markdown.ts";
 import { clip, MAX_NOTES, validId } from "./model.ts";
-import { modelCallOptions } from "./intelligence.ts";
+import { runToolLoop } from "./tool-loop.ts";
 
 export interface ScopedTool {
   name: string;
@@ -108,31 +108,19 @@ export async function applyStaged(memoryDir: string, staged: Map<string, string>
   return [...staged.keys()];
 }
 
-/** Bounded tool loop on the parent's registry: one assistant turn per iteration, no nested session. */
+/** Bounded tool loop on the parent's registry; a provider error fails the pass instead of looking like "nothing to save". */
 export async function runForkExtraction(input: ForkInput): Promise<{ staged: Map<string, string>; turns: number }> {
   const staged = new Map<string, string>();
   const existing = new Set(input.existingIds ?? []);
   const tools = memoryTools(input.memoryDir, staged, { existing, atCapacity: existing.size >= MAX_NOTES });
-  const declarations = tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters as never }));
-  const byName = new Map(tools.map(tool => [tool.name, tool]));
-  const messages: Message[] = [{
-    role: "user",
-    content: [{ type: "text", text: [FORK_PROMPT, "", "## Current index", input.index, "", "## New evidence", JSON.stringify(input.evidence)].join("\n") }],
-    timestamp: Date.now(),
-  }];
-  const limit = input.maxTurns ?? 6;
-  for (let turns = 1; turns <= limit; turns++) {
-    if (input.signal.aborted) break;
-    const reply = await input.modelRegistry.streamSimple(input.model, { messages, tools: declarations }, modelCallOptions(input.model, input.signal)).result();
-    if (reply.stopReason !== "toolUse") return { staged, turns };
-    messages.push(reply);
-    for (const call of reply.content.filter((part): part is ToolCall => part.type === "toolCall")) {
-      const tool = byName.get(call.name);
-      const text = tool
-        ? await tool.execute(call.id, call.arguments as never).then(result => result.content[0].text, (error: unknown) => `Error: ${error instanceof Error ? error.message : String(error)}`)
-        : `Unknown tool ${call.name}`;
-      messages.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
-    }
+  const prompt = [FORK_PROMPT, "", "## Current index", input.index, "", "## New evidence", JSON.stringify(input.evidence)].join("\n");
+  const loopTools = tools.map(tool => ({ ...tool, execute: async (args: unknown) => (await tool.execute("call", args as never)).content[0].text }));
+  try {
+    const result = await runToolLoop({ model: input.model, modelRegistry: input.modelRegistry, prompt, tools: loopTools, signal: input.signal, maxTurns: input.maxTurns ?? 6 });
+    return { staged, turns: result.turns };
+  } catch (error) {
+    // Running out of turns keeps the old behaviour: what was staged so far is still a complete set of files.
+    if (error instanceof Error && /did not finish within/.test(error.message)) return { staged, turns: input.maxTurns ?? 6 };
+    throw error;
   }
-  return { staged, turns: limit };
 }

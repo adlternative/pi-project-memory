@@ -9,7 +9,7 @@ export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInpu
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
 
 interface Metadata { hash: string; contentHash: string; source: Source; createdAt: string; updatedAt: string }
-interface DreamState { lastAt: number; sessionsSince: number; reviewed?: string[] }
+interface DreamState { lastAt: number; sessionsSince: number }
 interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string; dream?: DreamState }
 interface Loaded { state: State; disk: DiskState; metadata: FileText | null; index: FileText | null; documents: Map<string, FileText> }
 const emptyDisk = (): DiskState => ({ version: 2, revision: 0, records: {}, forgotten: [], indexHash: hash("") });
@@ -43,9 +43,7 @@ function validateDisk(value: unknown): DiskState {
   const rawDream = record(disk.dream ?? {});
   const lastAt = typeof rawDream.lastAt === "number" && Number.isFinite(rawDream.lastAt) ? rawDream.lastAt : 0;
   const sessionsSince = typeof rawDream.sessionsSince === "number" && Number.isFinite(rawDream.sessionsSince) ? Math.max(0, Math.floor(rawDream.sessionsSince)) : 0;
-  // Ids already reviewed in the current dream cycle; unknown or invalid ids are dropped, never fatal.
-  const reviewed = Array.isArray(rawDream.reviewed) ? [...new Set(rawDream.reviewed.filter((id): id is string => typeof id === "string" && validId(id) && Object.hasOwn(records, id)))] : [];
-  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash, dream: { lastAt, sessionsSince, ...(reviewed.length ? { reviewed } : {}) } };
+  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash, dream: { lastAt, sessionsSince } };
 }
 
 export interface ProjectIdentity { key: string; name: string }
@@ -87,6 +85,21 @@ async function gitCommonDir(cwd: string): Promise<string | null> {
     const { stdout } = await promisify(execFile)("git", ["rev-parse", "--git-common-dir"], { cwd, env, timeout: 2000, maxBuffer: 8192 });
     return stdout.trim() || null;
   } catch { /* Non-Git directories remain isolated by canonical cwd. */ return null; }
+}
+
+/**
+ * Tokens a merge must not drop: URLs, code spans without spaces, ticket/MR numbers (6+ digits), commit
+ * hashes (7+ hex with a digit and a letter) and file paths. Trailing sentence punctuation is not part of
+ * a token; dates and prose are not tokens.
+ */
+export function identifiers(text: string): string[] {
+  const found = new Set<string>();
+  const add = (token: string) => { const value = token.replace(/[.,;:!?)\]]+$/, ""); if (value.length >= 2) found.add(value); };
+  for (const match of text.matchAll(/https?:\/\/[^\s)\]>"'\uff0c\u3002\uff1b\u3001]+/gi)) add(match[0]);
+  for (const match of text.matchAll(/`([^`\s]{2,80})`/g)) add(match[1]);
+  for (const match of text.matchAll(/(?<![\w.])(?:(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}|\d{6,})(?!\w|\.\w)/gi)) add(match[0]);
+  for (const match of text.matchAll(/(?<![\w/~])(?:~?\/)?(?:[\w.-]+\/)+[\w.-]*\.[a-z][a-z0-9]{0,5}(?!\w)/gi)) add(match[0]);
+  return [...found];
 }
 
 /** Topic Markdown is authoritative; the hidden JSON stores only provenance and coordination metadata. */
@@ -164,8 +177,7 @@ export class MemoryStore {
     for (const [id, prior] of Object.entries(disk.records)) if (!documents.has(`${id}.md`) && !invalid.some(item => item.file === `${id}.md`)) forgotten.push(id, prior.contentHash);
     forgotten = [...new Set(forgotten)].slice(-MAX_FORGOTTEN);
     const fitted = renderIndexFitted(index?.text ?? null, notes);
-    const reviewed = (disk.dream?.reviewed ?? []).filter(id => notes.some(note => note.id === id));
-    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: fitted.text, ...(fitted.omitted.length ? { indexOmitted: fitted.omitted } : {}), ...(invalid.length ? { invalid } : {}), ...(truncated.length ? { truncated } : {}), ...(reviewed.length ? { dreamReviewed: reviewed } : {}) };
+    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: fitted.text, ...(fitted.omitted.length ? { indexOmitted: fitted.omitted } : {}), ...(invalid.length ? { invalid } : {}), ...(truncated.length ? { truncated } : {}) };
     const loaded: Loaded = { state, disk, metadata, index, documents };
     if (invalid.length) return loaded;
     if (legacy) {
@@ -283,6 +295,15 @@ export class MemoryStore {
     });
   }
 
+  /** The dream counters as stored; a store that was never used reports a pass that never ran. */
+  async dreamState(): Promise<{ lastAt: number; sessionsSince: number }> {
+    if (!await this.files.directory(false)) return { lastAt: 0, sessionsSince: 0 };
+    return this.files.locked(async () => {
+      const dream = (await this.load(true)).disk.dream;
+      return { lastAt: dream?.lastAt ?? 0, sessionsSince: dream?.sessionsSince ?? 0 };
+    });
+  }
+
   /** Hands a failed pass's claim back so the next session retries instead of waiting out minHours. */
   async releaseDream(prior: { lastAt: number; sessionsSince: number }, claimedAt: number): Promise<void> {
     await this.files.locked(async () => {
@@ -293,65 +314,79 @@ export class MemoryStore {
     });
   }
 
-  /** Writes the cadence counters; the review list is kept unless the caller passes a new one. */
-  private async writeDream(loaded: Loaded, dream: { lastAt: number; sessionsSince: number; reviewed?: string[] }): Promise<void> {
-    const reviewed = dream.reviewed ?? loaded.disk.dream?.reviewed;
-    const next = { lastAt: dream.lastAt, sessionsSince: dream.sessionsSince, ...(reviewed?.length ? { reviewed } : {}) };
-    await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream: next }, null, 2) + "\n" }]);
+  private async writeDream(loaded: Loaded, dream: DreamState): Promise<void> {
+    await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream }, null, 2) + "\n" }]);
   }
 
   /**
-   * Marks a finished pass's batch as reviewed for this cycle. Once every note has been reviewed the cycle
-   * starts over. Called for passes that reached the model, including ones that changed nothing.
+   * Applies a dream pass in one transaction. Each change carries the hash of the file the agent read, so a
+   * note edited meanwhile (by extraction, a user or another pass) aborts the whole pass instead of being
+   * overwritten; untouched notes may change freely. New notes need an id that is free and not forgotten,
+   * deletions are capped at a quarter of the notes, and the index budget applies to new notes.
    */
-  async markDreamReviewed(ids: string[]): Promise<{ reviewed: number; total: number }> {
+  async applyDream(changes: { id: string; before: string | null; after: Draft | null }[], options: { signal?: AbortSignal } = {}): Promise<{ created: string[]; updated: string[]; deleted: string[] }> {
+    const seen = new Set<string>();
+    for (const change of changes) {
+      if (!validId(change.id) || seen.has(change.id)) throw new Error(`Invalid or repeated memory id in dream: ${change.id}`);
+      seen.add(change.id);
+    }
+    const validated = changes.map(change => ({ ...change, after: change.after ? { ...validateInput(change.after), source: validateSource(change.after.source) } : null }));
     await this.adoptLegacyDir();
     return this.files.locked(async () => {
       const loaded = await this.load();
-      const live = new Set(loaded.state.notes.map(note => note.id));
-      let reviewed = [...new Set([...(loaded.disk.dream?.reviewed ?? []), ...ids])].filter(id => live.has(id));
-      if (reviewed.length >= live.size) reviewed = [];
-      const dream = { lastAt: loaded.disk.dream?.lastAt ?? 0, sessionsSince: loaded.disk.dream?.sessionsSince ?? 0, reviewed };
-      await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream: { lastAt: dream.lastAt, sessionsSince: dream.sessionsSince, ...(reviewed.length ? { reviewed } : {}) } }, null, 2) + "\n" }]);
-      return { reviewed: reviewed.length, total: live.size };
-    });
-  }
-
-  /** Applies a dream plan atomically: updates must exist, deletions are bounded and tombstoned. */
-  async consolidate(updates: Draft[], deletes: string[], options: { expectedRevision?: number; signal?: AbortSignal } = {}): Promise<{ updated: number; deleted: number }> {
-    const validated = updates.map(update => ({ ...validateInput(update), source: validateSource(update.source) }));
-    const removals = [...new Set(deletes)];
-    for (const id of removals) if (!validId(id)) throw new Error(`Invalid memory id: ${id}`);
-    await this.adoptLegacyDir();
-    return this.files.locked(async () => {
-      const loaded = await this.load();
-      if (options.expectedRevision !== undefined && loaded.state.revision !== options.expectedRevision) throw new Error("Memory changed during consolidation; stale plan discarded");
-      const notes = [...loaded.state.notes];
+      let notes = [...loaded.state.notes];
       let forgotten = [...loaded.state.forgotten];
       const edits = new Map<string, string | null>();
+      const result = { created: [] as string[], updated: [] as string[], deleted: [] as string[] };
       const now = new Date().toISOString();
-      let updated = 0;
-      for (const input of validated) {
-        const index = notes.findIndex(note => note.id === input.id);
-        if (index < 0) throw new Error(`Consolidation referenced an unknown id: ${input.id}`);
-        const existing = notes[index];
-        notes[index] = { ...existing, ...input, createdAt: existing.createdAt, updatedAt: now };
-        edits.set(`${input.id}.md`, renderTopic(notes[index]));
-        updated += 1;
+      for (const change of validated) {
+        const current = loaded.documents.get(`${change.id}.md`)?.hash ?? null;
+        if (current !== change.before) throw new Error(`${change.id}.md changed while dreaming; nothing was applied`);
+        const existing = notes.find(note => note.id === change.id);
+        if (!change.after) {
+          if (!existing) continue;
+          forgotten = [...new Set([...forgotten, change.id, fingerprint(existing.content)])];
+          notes = notes.filter(note => note.id !== change.id);
+          edits.set(`${change.id}.md`, null);
+          result.deleted.push(change.id);
+          continue;
+        }
+        if (change.after.id !== change.id) throw new Error(`Dream wrote ${change.after.id} into ${change.id}.md`);
+        if (!existing && (forgotten.includes(change.id) || forgotten.includes(fingerprint(change.after.content)))) throw new Error(`Dream tried to restore forgotten note ${change.id}; nothing was applied`);
+        const note: Memory = { ...change.after, createdAt: existing?.createdAt ?? now, updatedAt: now };
+        if (existing) notes[notes.indexOf(existing)] = note;
+        else notes.push(note);
+        edits.set(`${change.id}.md`, renderTopic(note));
+        (existing ? result.updated : result.created).push(change.id);
       }
-      if (removals.length > Math.max(1, Math.floor(loaded.state.notes.length / 4))) throw new Error("Consolidation tried to delete too many notes; nothing was changed");
-      let deleted = 0;
-      for (const id of removals) {
-        const note = notes.find(item => item.id === id);
-        if (!note) continue;
-        forgotten = [...new Set([...forgotten, id, fingerprint(note.content)])];
-        edits.set(`${id}.md`, null);
-        deleted += 1;
+      if (result.deleted.length > Math.max(1, Math.floor(loaded.state.notes.length / 4))) throw new Error("Dream tried to delete more than a quarter of the notes; nothing was applied");
+      // A merge must not lose identifiers: every ticket number, hash, URL, path or code span of a deleted
+      // note has to survive in some remaining note. A note the sessions showed to be wrong carries none
+      // that matter, so the agent rewrites the survivor to keep them or does not delete.
+      const remaining = notes.map(note => `${note.title}\n${note.description ?? ""}\n${note.content}`).join("\n");
+      for (const id of result.deleted) {
+        const gone = loaded.state.notes.find(note => note.id === id)!;
+        const missing = identifiers(`${gone.title}\n${gone.content}`).filter(token => !remaining.includes(token));
+        if (missing.length) throw new Error(`Deleting ${id} would lose ${missing.slice(0, 3).join(", ")}; merge them into a remaining note first. Nothing was applied`);
       }
-      const kept = notes.filter(note => !removals.includes(note.id));
-      await this.persist(loaded, kept, forgotten, edits, [], options.signal, { lastAt: Date.now(), sessionsSince: 0, ...(loaded.disk.dream?.reviewed?.length ? { reviewed: loaded.disk.dream.reviewed.filter(id => kept.some(note => note.id === id)) } : {}) });
-      return { updated, deleted };
+      if (notes.length > MAX_NOTES) throw new Error("Memory limit reached; dream may not add notes past the cap");
+      const before = renderIndexFitted(loaded.index?.text ?? null, loaded.state.notes).omitted.length;
+      if (result.created.length && renderIndexFitted(loaded.index?.text ?? null, notes).omitted.length > before) throw new Error(`MEMORY.md exceeds ${INDEX_BYTES.toLocaleString("en-US")} UTF-8 bytes; dream may not add notes until others are merged`);
+      // Every finished pass moves the timer, so the next one only reviews sessions after this one.
+      const dream = { lastAt: Date.now(), sessionsSince: 0 };
+      if (edits.size) await this.persist(loaded, notes, forgotten, edits, [], options.signal, dream);
+      else await this.writeDream(loaded, dream);
+      return result;
     }, options.signal);
+  }
+
+  /** Each topic file's text and hash as on disk, so a dream reads exactly what its changes are checked against. */
+  async topicFiles(): Promise<Map<string, { text: string; hash: string }>> {
+    if (!await this.files.directory(false)) return new Map();
+    return this.files.locked(async () => {
+      const loaded = await this.load(true);
+      return new Map([...loaded.documents].map(([name, file]) => [name.replace(/\.md$/, ""), { text: file.text, hash: file.hash }]));
+    });
   }
 
   async forget(id: string): Promise<void> {

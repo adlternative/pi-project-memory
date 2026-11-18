@@ -1,12 +1,13 @@
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, loadProjectContextFiles, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { clip, fingerprint, MemoryStore, projectIdentity, record, redact, TYPES, validateInput, type Memory } from "./store.ts";
+import { clip, fingerprint, MemoryStore, projectIdentity, redact, TYPES, type Memory } from "./store.ts";
 import { search } from "./search.ts";
-import { pickDreamBatch } from "./dream-batch.ts";
-import { INDEX_BYTES, INDEX_SOFT_RATIO } from "./markdown.ts";
+import { runDreamAgent } from "./dream.ts";
+import { projectSessions } from "./sessions.ts";
+import { INDEX_BYTES, INDEX_SOFT_RATIO, parseTopic } from "./markdown.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, MemoryModelError, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
 import { applyStaged, runForkExtraction } from "./fork-extraction.ts";
@@ -307,27 +308,28 @@ export default function projectMemory(pi: ExtensionAPI) {
     idleTimer = timer;
   }
 
-  // Whole notes in, rewritten notes out: keep the batch well under the 32 KB reply cap. Newest notes first.
-  const DREAM_INPUT_BYTES = 12_000;
-  const DREAM_PROMPT = `Consolidate this project's memory. Return JSON only: {"updates":[{"id":"existing-id","type":"...","title":"...","content":"..."}],"deletes":["existing-id"],"note":"one sentence"}
-
-Rules: every note is given in full. Use only ids from this input - never invent one. Merge notes that say the same thing: keep the clearest title and move the other notes' details into the surviving note, then delete the others. Delete only notes that are wrong, obsolete, or fully covered by another note in this input. An update must keep every fact of the note it replaces and of the notes merged into it; never shorten a note by dropping detail, and never add facts that are not in the input. Never delete more than a quarter of the notes. Do not add new memories. Return empty arrays when nothing should change.`;
-
   /**
-   * Claude Code style dream: one consolidation pass over the existing notes, applied as one transaction.
+   * Claude Code style dream: a sub-agent with memory and session tools reviews what changed in this project
+   * since the last pass and folds it into the notes; its staged changes are applied as one transaction.
    * Runs on a cadence (min hours AND min sessions) or on demand, never concurrently with another pass.
    */
   type DreamOutcome = { kind: "empty" } | { kind: "busy" } | { kind: "finished"; text: string };
+  // Long enough for a few dozen tool turns on a slow model; a pass past this applies nothing.
+  const DREAM_TIMEOUT_MS = 6 * 60_000;
+  // When the store has no record of an earlier pass, look back this far for sessions.
+  const DREAM_FIRST_LOOKBACK_MS = 7 * 86_400_000;
+  // Newest first; a pass reads a few of them, so a long list only costs prompt space.
+  const DREAM_MAX_SESSIONS = 25;
 
   async function runDream(ctx: ExtensionContext, trigger: "schedule" | "manual", claim?: { prior: { lastAt: number; sessionsSince: number }; at: number }): Promise<DreamOutcome> {
     const memory = await getStore(ctx);
     // A scheduled pass that never reaches the model (busy, empty, paused, aborted) hands its claim back.
     let release = !!claim;
-    try { return await dreamPass(ctx, memory, trigger, () => { release = false; }); }
+    try { return await dreamPass(ctx, memory, trigger, claim?.prior.lastAt, () => { release = false; }); }
     finally { if (release && claim) await memory.releaseDream(claim.prior, claim.at).catch(() => {}); }
   }
 
-  async function dreamPass(ctx: ExtensionContext, memory: MemoryStore, trigger: "schedule" | "manual", settle: () => void): Promise<DreamOutcome> {
+  async function dreamPass(ctx: ExtensionContext, memory: MemoryStore, trigger: "schedule" | "manual", lastAt: number | undefined, settle: () => void): Promise<DreamOutcome> {
     if (!lifecycle) return { kind: "busy" };
     if (jobs.size) { trailing = true; return { kind: "busy" }; }
     if (quotaPaused(trigger)) {
@@ -337,67 +339,63 @@ Rules: every note is given in full. Use only ids from this input - never invent 
     const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
     if (!snapshot || snapshot.invalid || !snapshot.notes.length) return { kind: "empty" };
     const { model, requested } = extractionModel(ctx);
-    // Whole notes only: the model rewrites what it sees, so a preview would come back as a truncated note.
-    // Clamped notes are skipped because their full text is not in memory. Batches rotate through the store
-    // by topic instead of always taking the newest notes, which a pass that changed nothing would repeat.
-    const candidates = pickDreamBatch(snapshot.notes, new Set(snapshot.dreamReviewed ?? []), new Set(snapshot.truncated ?? []), DREAM_INPUT_BYTES);
-    if (!candidates.length) return { kind: "empty" };
-    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(60_000)]);
+    if (!model) return { kind: "busy" };
+    const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(DREAM_TIMEOUT_MS)]);
     const started = Date.now();
-    ctx.ui.setStatus("pmem-dream", `dreaming over ${candidates.length} notes`);
+    ctx.ui.setStatus("pmem-dream", `dreaming over ${snapshot.notes.length} notes`);
     let finished = "";
     const job: Promise<void> = (async () => {
       try {
-        const { data, response } = await modelJSON(ctx, model, DREAM_PROMPT, candidates, signal);
-        const plan = record(data);
-        if (Object.keys(plan).some(key => !["updates", "deletes", "note"].includes(key))) throw new Error("Unexpected field in dream plan");
-        const updates = Array.isArray(plan.updates) ? plan.updates : [];
-        const deletes = Array.isArray(plan.deletes) ? plan.deletes.filter((id): id is string => typeof id === "string") : [];
-        // The plan may only touch notes the model saw in full in this pass.
-        const shown = new Set(candidates.map(item => item.id));
-        const outside = [...updates.map(item => String(record(item).id)), ...deletes].filter(id => !shown.has(id));
-        if (outside.length) throw new Error(`Dream plan touched notes outside this pass: ${outside.slice(0, 3).join(", ")}`);
-        const drafts = updates.map(item => {
-          const value = record(item);
-          return {
-            ...validateInput(value),
-            source: { sessionId: ctx.sessionManager.getSessionId(), entryId: "dream", quote: clip(String(plan.note ?? "consolidation"), 400), origin: "extracted" as const },
-          };
-        });
-        if (drafts.length || deletes.length) await memory.consolidate(drafts, deletes, { expectedRevision: snapshot.revision, signal });
-        // The whole batch counts as reviewed, changed or not, so the next pass looks at other notes.
-        const progress = await memory.markDreamReviewed(candidates.map(item => item.id).filter(id => !deletes.includes(id)));
+        // Sessions since the last pass, like Claude Code; the current session is included for /pmem dream.
+        const recorded = lastAt ?? (await memory.dreamState()).lastAt;
+        const since = recorded > 0 ? recorded : Date.now() - DREAM_FIRST_LOOKBACK_MS;
+        // Sessions live under one root with a directory per cwd; take it from the current session so a custom
+        // session directory works, falling back to Pi's default.
+        const current = ctx.sessionManager.getSessionFile();
+        const sessionsRoot = current ? dirname(dirname(current)) : join(getAgentDir(), "sessions");
+        const sessions = (await projectSessions(sessionsRoot, ctx.cwd, since)).slice(0, DREAM_MAX_SESSIONS);
+        const instructions = loadProjectContextFiles({ cwd: ctx.cwd, agentDir: getAgentDir() }).filter(file => /(^|\/)(AGENTS|CLAUDE)\.md$/.test(file.path) && !file.path.startsWith(getAgentDir()));
+        const today = new Date().toISOString().slice(0, 10);
+        const { changes, loop } = await runDreamAgent({ model, modelRegistry: ctx.modelRegistry, store: memory, notes: snapshot.notes, index: snapshot.index, sessions, instructions, today, signal });
+        signal.throwIfAborted();
+        const source = { sessionId: ctx.sessionManager.getSessionId(), entryId: "dream", quote: clip(redact(loop.text || "consolidation"), 400), origin: "extracted" as const };
+        const applied = await memory.applyDream(changes.map(change => ({
+          id: change.id, before: change.before,
+          after: change.after === null ? null : { ...parseTopic(`${change.id}.md`, change.after), source },
+        })), { signal });
         const after = await memory.read({ tolerant: true });
         const seconds = Math.max(1, Math.round((Date.now() - started) / 1000));
+        const changed = applied.created.length + applied.updated.length + applied.deleted.length;
         const summary = {
-          status: "ok" as const, trigger, seconds, notes: candidates.length, reviewed: progress.reviewed, total: progress.total,
-          updated: drafts.map(item => item.id), deleted: deletes, note: clip(String(plan.note ?? ""), 200) || undefined,
+          status: "ok" as const, trigger, seconds, turns: loop.turns, sessions: sessions.length, notes: snapshot.notes.length,
+          created: applied.created, updated: applied.updated, deleted: applied.deleted, note: clip(redact(loop.text), 400) || undefined,
           indexBefore: Buffer.byteLength(snapshot.index), indexAfter: Buffer.byteLength(after.index),
-          provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage,
+          provider: loop.provider, model: loop.model, ...(requested ? { requestedModel: requested } : {}), usage: loop.usage,
         };
         pi.appendEntry("pi-project-memory.dream", summary);
         settle();
         checkpoint();
-        const changed = drafts.length + deletes.length;
-        const lines = [
-          changed ? `**Dream done in ${seconds}s**: ${drafts.length} rewritten, ${deletes.length} removed.` : `**Dream done in ${seconds}s**: nothing worth changing in this batch.`,
-          progress.reviewed ? `reviewed ${progress.reviewed} of ${progress.total} notes this cycle; run /pmem dream again for the next batch` : `reviewed all ${progress.total} notes; the next pass starts a new cycle`,
+        const list = (label: string, ids: string[]) => ids.length ? `${label}: ${ids.map(id => `\`${id}\``).join(", ")}` : "";
+        finished = [
+          changed
+            ? `**Dream done in ${seconds}s** (${loop.turns} turns, ${sessions.length} sessions reviewed): ${applied.updated.length} updated, ${applied.created.length} added, ${applied.deleted.length} removed.`
+            : `**Dream done in ${seconds}s** (${loop.turns} turns, ${sessions.length} sessions reviewed): nothing to consolidate.`,
           changed ? `index ${summary.indexBefore} → ${summary.indexAfter} bytes` : "",
-          drafts.length ? `rewritten: ${drafts.map(item => `\`${item.id}\``).join(", ")}` : "",
-          deletes.length ? `removed: ${deletes.map(id => `\`${id}\``).join(", ")}` : "",
-          summary.note ? `_${summary.note}_` : "",
-        ].filter(Boolean);
-        finished = lines.join("\n");
+          list("updated", applied.updated), list("added", applied.created), list("removed", applied.deleted),
+          summary.note ? `_${clip(summary.note, 300)}_` : "",
+        ].filter(Boolean).join("\n");
         if (trigger === "schedule") report(finished);
-        if (ctx.hasUI && changed) ctx.ui.notify(`Dream: ${drafts.length} rewritten, ${deletes.length} removed.`, "info");
+        if (ctx.hasUI && changed) ctx.ui.notify(`Dream: ${applied.updated.length} updated, ${applied.created.length} added, ${applied.deleted.length} removed.`, "info");
       } catch (error) {
-        if (signal.aborted) return;
-        const reason = clip(redact(error instanceof Error ? error.message : String(error)), 300);
+        if (lifecycle?.signal.aborted) return;
+        const timedOut = signal.aborted;
+        const reason = timedOut ? `did not finish within ${DREAM_TIMEOUT_MS / 60_000} minutes` : clip(redact(error instanceof Error ? error.message : String(error)), 300);
         noteQuota(reason);
         // A pass that reached the model keeps the timer even when it failed: every session start retrying
         // would burn the provider's quota. Only a pass that never ran hands the claim back.
         settle();
-        pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, seconds: Math.max(1, Math.round((Date.now() - started) / 1000)), notes: candidates.length, reason });
+        const usage = error instanceof MemoryModelError ? error.response.usage : undefined;
+        pi.appendEntry("pi-project-memory.dream", { status: "failed", trigger, seconds: Math.max(1, Math.round((Date.now() - started) / 1000)), notes: snapshot.notes.length, reason, ...(usage ? { usage } : {}) });
         finished = `**Dream failed**: ${reason}. Notes are unchanged.`;
         if (trigger === "schedule") report(finished);
       }
