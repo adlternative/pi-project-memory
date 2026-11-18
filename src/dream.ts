@@ -5,7 +5,7 @@ import { INDEX_BYTES, parseTopic } from "./markdown.ts";
 import { clip, hash, redact, validId, type Memory } from "./model.ts";
 import { search } from "./search.ts";
 import { sessionDigest, searchSessions, sessionTitle, type ProjectSession } from "./sessions.ts";
-import { identifiers, type MemoryStore } from "./store.ts";
+import { dreamDeleteLimit, identifiers, type MemoryStore } from "./store.ts";
 import { runToolLoop, type LoopResult, type LoopTool } from "./tool-loop.ts";
 
 // Claude Code's fork runs up to 50 turns; a pass that runs out still applies what it staged, like CC.
@@ -63,7 +63,7 @@ ${input.instructions.length ? `- These project instruction files are maintained 
 ## Phase 4 - Keep it small
 - The index is built from note titles. Keep titles short and specific.
 - Each note covers one topic. Move detail out of a note that has grown past one topic.
-- Delete notes that are obsolete or fully covered by another note. Delete at most a quarter of the notes in one pass.
+- Delete notes that are obsolete or fully covered by another note. Delete at most ${dreamDeleteLimit(input.noteCount)} notes in this pass; delete_note refuses more.
 
 Note format for write_note: the whole file, starting with frontmatter:
 ---
@@ -182,9 +182,13 @@ export function dreamTools(input: { notes: Memory[]; files: Map<string, { text: 
           if (missing.length) throw new Error(`Deleting ${id} would lose ${missing.slice(0, 5).join(", ")}. Copy them into the note that replaces it with write_note, then delete again`);
         }
         const before = input.staged.has(id) ? input.staged.get(id)!.before : input.files.get(id)?.hash ?? null;
+        // The store refuses a pass past this limit, which would discard every change in it.
+        const deleting = [...input.staged.values()].filter(change => change.after === null && change.before !== null && change.id !== id).length + (before === null ? 0 : 1);
+        const limit = dreamDeleteLimit(input.files.size);
+        if (deleting > limit) throw new Error(`One pass may delete at most ${limit} of ${input.files.size} notes and ${deleting - 1} are already staged. Keep this note, or merge into it instead of deleting`);
         if (before === null) input.staged.delete(id);
         else input.staged.set(id, { id, before, after: null });
-        return `Staged deletion of ${id}.`;
+        return `Staged deletion of ${id} (${deleting} of at most ${limit} this pass).`;
       },
     },
     {

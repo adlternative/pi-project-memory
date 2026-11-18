@@ -61,7 +61,8 @@ test("applyDream applies a pass atomically and refuses unsafe ones", async t => 
   assert.match(await readFile(join(store.dir, "a.md"), "utf8"), /Alpha\./, "the untouched part of the failed pass did not apply either");
 
   const fresh = await store.topicFiles();
-  await assert.rejects(store.applyDream([{ id: "a", before: fresh.get("a")!.hash, after: null }, { id: "c", before: fresh.get("c")!.hash, after: null }]), /more than a quarter/);
+  // Five notes allow 2 deletions per pass; 3 are refused.
+  await assert.rejects(store.applyDream(["a", "c", "d"].map(id => ({ id, before: fresh.get(id)!.hash, after: null }))), /delete 3 of 5 notes, more than the 2 allowed/);
   await store.forget("e");
   await assert.rejects(store.applyDream([{ id: "e", before: null, after: draft("e", "Epsilon back.") }]), /restore forgotten note e/);
 
@@ -233,4 +234,33 @@ test("write_note refuses a new note that would overflow the index and accepts an
   await assert.rejects(tools.write_note.execute({ id: "brand-new-topic", content: renderTopic(note("brand-new-topic", "x", "A long title that will not fit in the index")) }), /would push MEMORY\.md/);
   await tools.read_note.execute({ id: "n-000" });
   assert.match(await tools.write_note.execute({ id: "n-000", content: renderTopic(note("n-000", "Body 0, updated.", "A long title that fills the index 0")) }), /Staged/);
+});
+
+test("delete_note refuses past the per-pass limit so the rest of the pass still applies", async t => {
+  // Six notes, as in the ~/test store: the limit is 2, and a third deletion used to discard the whole pass.
+  let turn = 0;
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true } },
+    answer: request => {
+      if (!JSON.stringify(request.context).includes("Dream: consolidate this project")) return "Done.";
+      turn += 1;
+      if (turn === 1) return tool("read_note", { id: "n1" });
+      if (turn === 2) return tool("write_note", { id: "n1", content: renderTopic(note("n1", "Merged one, two and three.")) });
+      if (turn === 3) return tool("read_note", { id: "n2" });
+      if (turn === 4) return tool("delete_note", { id: "n2" });
+      if (turn === 5) return tool("read_note", { id: "n3" });
+      if (turn === 6) return tool("delete_note", { id: "n3" });
+      if (turn === 7) return tool("read_note", { id: "n4" });
+      if (turn === 8) return tool("delete_note", { id: "n4" });
+      return "Merged notes; one deletion was refused.";
+    },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  for (const id of ["n1", "n2", "n3", "n4", "n5", "n6"]) await writeFile(join(h.store.dir, `${id}.md`), renderTopic(note(id, `Note ${id}.`)));
+  await h.session.prompt("/pmem dream");
+  const data = h.manager.getEntries().flatMap(item => item.type === "custom" && item.customType === "pi-project-memory.dream" ? [item] : []).at(-1)!.data as { status?: string; updated?: string[]; deleted?: string[]; reason?: string };
+  assert.equal(data.status, "ok", String(data.reason));
+  assert.deepEqual(data.updated, ["n1"]);
+  assert.deepEqual(data.deleted, ["n2", "n3"]);
+  assert.deepEqual((await h.store.read()).notes.map(item => item.id).sort(), ["n1", "n4", "n5", "n6"]);
 });

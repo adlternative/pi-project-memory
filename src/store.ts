@@ -102,6 +102,14 @@ export function identifiers(text: string): string[] {
   return [...found];
 }
 
+/**
+ * Most notes one dream pass may delete: a quarter, but at least 2 so a small store can merge a pair.
+ * Shared by the store and the delete tool so the agent learns the limit before it is refused.
+ */
+export function dreamDeleteLimit(notes: number): number {
+  return Math.max(2, Math.floor(notes / 4));
+}
+
 /** Topic Markdown is authoritative; the hidden JSON stores only provenance and coordination metadata. */
 export class MemoryStore {
   readonly dir: string;
@@ -359,7 +367,7 @@ export class MemoryStore {
         edits.set(`${change.id}.md`, renderTopic(note));
         (existing ? result.updated : result.created).push(change.id);
       }
-      if (result.deleted.length > Math.max(1, Math.floor(loaded.state.notes.length / 4))) throw new Error("Dream tried to delete more than a quarter of the notes; nothing was applied");
+      if (result.deleted.length > dreamDeleteLimit(loaded.state.notes.length)) throw new Error(`Dream tried to delete ${result.deleted.length} of ${loaded.state.notes.length} notes, more than the ${dreamDeleteLimit(loaded.state.notes.length)} allowed in one pass; nothing was applied`);
       // A merge must not lose identifiers: every ticket number, hash, URL, path or code span of a deleted
       // note has to survive in some remaining note. A note the sessions showed to be wrong carries none
       // that matter, so the agent rewrites the survivor to keep them or does not delete.
