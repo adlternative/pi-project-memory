@@ -394,3 +394,44 @@ test("a scheduled dream that never reached the model hands its claim back", asyn
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.ok(await h.store.claimDream(24, 1), "the skipped pass must leave the store due");
 });
+
+test("repeated /pmem dream moves through the store instead of rereading the newest notes", async t => {
+  const batches: string[][] = [];
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true } },
+    answer: request => {
+      if (!JSON.stringify(request.context).includes("Consolidate this project's memory")) return "Done.";
+      const last = request.context.messages.findLast(message => message.role === "user");
+      const body = last && typeof last.content !== "string" ? last.content.map(part => part.type === "text" ? part.text : "").join("") : String(last?.content ?? "");
+      batches.push((JSON.parse(body) as { id: string }[]).map(item => item.id));
+      return JSON.stringify({ updates: [], deletes: [], note: "nothing" });
+    },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  for (let i = 0; i < 40; i += 1) {
+    const id = `note-${String(i).padStart(2, "0")}`;
+    await writeFile(join(h.store.dir, `${id}.md`), renderTopic({ ...note, id, title: `Topic ${i}`, content: `Rule ${i}: ${"keep this workflow detail. ".repeat(30)}`, source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: `2026-01-01T00:${String(i).padStart(2, "0")}:00.000Z` }));
+  }
+  for (let pass = 0; pass < 6 && new Set(batches.flat()).size < 40; pass += 1) await h.session.prompt("/pmem dream");
+  assert.ok(batches.length >= 2, "expected several passes");
+  assert.notDeepEqual(batches[1], batches[0], "the second pass must not resend the first batch");
+  assert.equal(new Set(batches.flat()).size, 40, "repeated passes must reach every note");
+  const report = [...h.manager.getEntries()].reverse().find(item => item.type === "custom_message" && item.customType === "pi-project-memory.report");
+  assert.ok(report && report.type === "custom_message");
+  assert.match(typeof report.content === "string" ? report.content : JSON.stringify(report.content), /reviewed (\d+ of 40 notes|all 40 notes)/);
+});
+
+test("an ephemeral session neither counts toward nor runs a scheduled dream", async t => {
+  let calls = 0;
+  const h = await makeHarness(t, {
+    persistent: false,
+    settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 0 } },
+    answer: request => { if (JSON.stringify(request.context).includes("Consolidate this project's memory")) calls += 1; return "Done."; },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  await writeFile(join(h.store.dir, "alpha.md"), renderTopic({ ...note, id: "alpha", content: "Use pnpm.", source, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+  for (let i = 0; i < 3; i += 1) await h.session.extensionRunner.emit({ type: "session_start", reason: "startup" } as never);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(calls, 0);
+  assert.equal(await h.store.claimDream(0, 1), null, "ephemeral starts must not count as sessions");
+});

@@ -5,6 +5,7 @@ import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { clip, fingerprint, MemoryStore, projectIdentity, record, redact, TYPES, validateInput, type Memory } from "./store.ts";
 import { search } from "./search.ts";
+import { pickDreamBatch } from "./dream-batch.ts";
 import { INDEX_BYTES, INDEX_SOFT_RATIO } from "./markdown.ts";
 import { validId } from "./model.ts";
 import { evidenceSinceCheckpoint, EXTRACTION_PROMPT, MemoryModelError, modelJSON, parseExtraction, semanticSearch } from "./intelligence.ts";
@@ -337,18 +338,9 @@ Rules: every note is given in full. Use only ids from this input - never invent 
     if (!snapshot || snapshot.invalid || !snapshot.notes.length) return { kind: "empty" };
     const { model, requested } = extractionModel(ctx);
     // Whole notes only: the model rewrites what it sees, so a preview would come back as a truncated note.
-    // Clamped notes are skipped because their full text is not in memory. Fill the budget newest first.
-    const candidates: { id: string; type: string; title: string; content: string }[] = [];
-    const clamped = new Set(snapshot.truncated ?? []);
-    let budget = DREAM_INPUT_BYTES;
-    for (const note of [...snapshot.notes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
-      if (clamped.has(note.id)) continue;
-      const item = { id: note.id, type: note.type, title: note.title, content: note.content };
-      const size = Buffer.byteLength(JSON.stringify(item)) + 1;
-      if (size > budget) break;
-      budget -= size;
-      candidates.push(item);
-    }
+    // Clamped notes are skipped because their full text is not in memory. Batches rotate through the store
+    // by topic instead of always taking the newest notes, which a pass that changed nothing would repeat.
+    const candidates = pickDreamBatch(snapshot.notes, new Set(snapshot.dreamReviewed ?? []), new Set(snapshot.truncated ?? []), DREAM_INPUT_BYTES);
     if (!candidates.length) return { kind: "empty" };
     const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(60_000)]);
     const started = Date.now();
@@ -373,10 +365,12 @@ Rules: every note is given in full. Use only ids from this input - never invent 
           };
         });
         if (drafts.length || deletes.length) await memory.consolidate(drafts, deletes, { expectedRevision: snapshot.revision, signal });
+        // The whole batch counts as reviewed, changed or not, so the next pass looks at other notes.
+        const progress = await memory.markDreamReviewed(candidates.map(item => item.id).filter(id => !deletes.includes(id)));
         const after = await memory.read({ tolerant: true });
         const seconds = Math.max(1, Math.round((Date.now() - started) / 1000));
         const summary = {
-          status: "ok" as const, trigger, seconds, notes: candidates.length,
+          status: "ok" as const, trigger, seconds, notes: candidates.length, reviewed: progress.reviewed, total: progress.total,
           updated: drafts.map(item => item.id), deleted: deletes, note: clip(String(plan.note ?? ""), 200) || undefined,
           indexBefore: Buffer.byteLength(snapshot.index), indexAfter: Buffer.byteLength(after.index),
           provider: response.provider, model: response.model, ...(requested ? { requestedModel: requested } : {}), usage: response.usage,
@@ -386,7 +380,8 @@ Rules: every note is given in full. Use only ids from this input - never invent 
         checkpoint();
         const changed = drafts.length + deletes.length;
         const lines = [
-          changed ? `**Dream done in ${seconds}s**: ${drafts.length} rewritten, ${deletes.length} removed.` : `**Dream done in ${seconds}s**: nothing worth changing.`,
+          changed ? `**Dream done in ${seconds}s**: ${drafts.length} rewritten, ${deletes.length} removed.` : `**Dream done in ${seconds}s**: nothing worth changing in this batch.`,
+          progress.reviewed ? `reviewed ${progress.reviewed} of ${progress.total} notes this cycle; run /pmem dream again for the next batch` : `reviewed all ${progress.total} notes; the next pass starts a new cycle`,
           changed ? `index ${summary.indexBefore} → ${summary.indexAfter} bytes` : "",
           drafts.length ? `rewritten: ${drafts.map(item => `\`${item.id}\``).join(", ")}` : "",
           deletes.length ? `removed: ${deletes.map(id => `\`${id}\``).join(", ")}` : "",
@@ -449,6 +444,9 @@ Rules: every note is given in full. Use only ids from this input - never invent 
     if (!readSettings(pi).dedicatedTools) pi.setActiveTools(pi.getActiveTools().filter(name => !name.startsWith("pmem_")));
     const settings = readSettings(pi);
     if (!settings.enabled) return;
+    // Like extraction, only sessions with a transcript count: a `pi -p` run would exit before a background
+    // pass finished and would advance the timer without a record of the pass.
+    if (!ctx.sessionManager.getSessionFile()) return;
     // Count this session, then claim and run a due pass in the background so the session starts immediately.
     let memory: MemoryStore;
     try { memory = await getStore(ctx); await memory.noteDreamSession(); } catch { return; }

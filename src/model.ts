@@ -5,7 +5,7 @@ export type MemoryType = (typeof TYPES)[number];
 export interface MemoryInput { id: string; type: MemoryType; title: string; description?: string; content: string }
 export interface Source { sessionId: string; entryId: string; quote: string; origin: "explicit" | "extracted" | "file" }
 export interface Memory extends MemoryInput { source: Source; createdAt: string; updatedAt: string }
-export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; indexOmitted?: string[]; truncated?: string[]; invalid?: { file: string; error: string }[] }
+export interface State { version: 2; revision: number; notes: Memory[]; forgotten: string[]; index: string; indexOmitted?: string[]; truncated?: string[]; dreamReviewed?: string[]; invalid?: { file: string; error: string }[] }
 export interface Draft extends MemoryInput { source: Source }
 // Count is a safety net only: the index budget (25 KB) is the real constraint, as in Claude Code.
 export const MAX_NOTES = 1024;

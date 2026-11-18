@@ -9,7 +9,8 @@ export { clip, fingerprint, hash, MAX_NOTES, record, redact, TYPES, validateInpu
 export type { Draft, Memory, MemoryInput, MemoryType, Source, State } from "./model.ts";
 
 interface Metadata { hash: string; contentHash: string; source: Source; createdAt: string; updatedAt: string }
-interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string; dream?: { lastAt: number; sessionsSince: number } }
+interface DreamState { lastAt: number; sessionsSince: number; reviewed?: string[] }
+interface DiskState { version: 2; revision: number; records: Record<string, Metadata>; forgotten: string[]; indexHash: string; dream?: DreamState }
 interface Loaded { state: State; disk: DiskState; metadata: FileText | null; index: FileText | null; documents: Map<string, FileText> }
 const emptyDisk = (): DiskState => ({ version: 2, revision: 0, records: {}, forgotten: [], indexHash: hash("") });
 const emptyState = (): State => ({ version: 2, revision: 0, notes: [], forgotten: [], index: renderIndexFitted(null, []).text });
@@ -42,7 +43,9 @@ function validateDisk(value: unknown): DiskState {
   const rawDream = record(disk.dream ?? {});
   const lastAt = typeof rawDream.lastAt === "number" && Number.isFinite(rawDream.lastAt) ? rawDream.lastAt : 0;
   const sessionsSince = typeof rawDream.sessionsSince === "number" && Number.isFinite(rawDream.sessionsSince) ? Math.max(0, Math.floor(rawDream.sessionsSince)) : 0;
-  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash, dream: { lastAt, sessionsSince } };
+  // Ids already reviewed in the current dream cycle; unknown or invalid ids are dropped, never fatal.
+  const reviewed = Array.isArray(rawDream.reviewed) ? [...new Set(rawDream.reviewed.filter((id): id is string => typeof id === "string" && validId(id) && Object.hasOwn(records, id)))] : [];
+  return { version: 2, revision: disk.revision as number, records, forgotten: validateForgotten(disk.forgotten), indexHash: disk.indexHash, dream: { lastAt, sessionsSince, ...(reviewed.length ? { reviewed } : {}) } };
 }
 
 export interface ProjectIdentity { key: string; name: string }
@@ -161,7 +164,8 @@ export class MemoryStore {
     for (const [id, prior] of Object.entries(disk.records)) if (!documents.has(`${id}.md`) && !invalid.some(item => item.file === `${id}.md`)) forgotten.push(id, prior.contentHash);
     forgotten = [...new Set(forgotten)].slice(-MAX_FORGOTTEN);
     const fitted = renderIndexFitted(index?.text ?? null, notes);
-    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: fitted.text, ...(fitted.omitted.length ? { indexOmitted: fitted.omitted } : {}), ...(invalid.length ? { invalid } : {}), ...(truncated.length ? { truncated } : {}) };
+    const reviewed = (disk.dream?.reviewed ?? []).filter(id => notes.some(note => note.id === id));
+    const state: State = { version: 2, revision: disk.revision, notes, forgotten, index: fitted.text, ...(fitted.omitted.length ? { indexOmitted: fitted.omitted } : {}), ...(invalid.length ? { invalid } : {}), ...(truncated.length ? { truncated } : {}), ...(reviewed.length ? { dreamReviewed: reviewed } : {}) };
     const loaded: Loaded = { state, disk, metadata, index, documents };
     if (invalid.length) return loaded;
     if (legacy) {
@@ -289,8 +293,28 @@ export class MemoryStore {
     });
   }
 
-  private async writeDream(loaded: Loaded, dream: { lastAt: number; sessionsSince: number }): Promise<void> {
-    await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream }, null, 2) + "\n" }]);
+  /** Writes the cadence counters; the review list is kept unless the caller passes a new one. */
+  private async writeDream(loaded: Loaded, dream: { lastAt: number; sessionsSince: number; reviewed?: string[] }): Promise<void> {
+    const reviewed = dream.reviewed ?? loaded.disk.dream?.reviewed;
+    const next = { lastAt: dream.lastAt, sessionsSince: dream.sessionsSince, ...(reviewed?.length ? { reviewed } : {}) };
+    await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream: next }, null, 2) + "\n" }]);
+  }
+
+  /**
+   * Marks a finished pass's batch as reviewed for this cycle. Once every note has been reviewed the cycle
+   * starts over. Called for passes that reached the model, including ones that changed nothing.
+   */
+  async markDreamReviewed(ids: string[]): Promise<{ reviewed: number; total: number }> {
+    await this.adoptLegacyDir();
+    return this.files.locked(async () => {
+      const loaded = await this.load();
+      const live = new Set(loaded.state.notes.map(note => note.id));
+      let reviewed = [...new Set([...(loaded.disk.dream?.reviewed ?? []), ...ids])].filter(id => live.has(id));
+      if (reviewed.length >= live.size) reviewed = [];
+      const dream = { lastAt: loaded.disk.dream?.lastAt ?? 0, sessionsSince: loaded.disk.dream?.sessionsSince ?? 0, reviewed };
+      await this.files.commit([{ name: ".state.json", before: loaded.metadata?.hash ?? null, after: JSON.stringify({ ...loaded.disk, dream: { lastAt: dream.lastAt, sessionsSince: dream.sessionsSince, ...(reviewed.length ? { reviewed } : {}) } }, null, 2) + "\n" }]);
+      return { reviewed: reviewed.length, total: live.size };
+    });
   }
 
   /** Applies a dream plan atomically: updates must exist, deletions are bounded and tombstoned. */
@@ -325,7 +349,7 @@ export class MemoryStore {
         deleted += 1;
       }
       const kept = notes.filter(note => !removals.includes(note.id));
-      await this.persist(loaded, kept, forgotten, edits, [], options.signal, { lastAt: Date.now(), sessionsSince: 0 });
+      await this.persist(loaded, kept, forgotten, edits, [], options.signal, { lastAt: Date.now(), sessionsSince: 0, ...(loaded.disk.dream?.reviewed?.length ? { reviewed: loaded.disk.dream.reviewed.filter(id => kept.some(note => note.id === id)) } : {}) });
       return { updated, deleted };
     }, options.signal);
   }

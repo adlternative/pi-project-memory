@@ -187,7 +187,7 @@ Structured output is `{directory,indexPath,notes,truncated,nextOffset}`; each `n
 | `/pmem forget <id>` | Delete the topic, drop its link, record a tombstone |
 | `/pmem compact` | Report exact duplicates and notes unused for 180 days, plus index usage |
 | `/pmem compact apply` | Delete the extra copies of exact duplicates |
-| `/pmem dream` | Consolidate now: merge duplicates, tighten wording, delete what is obsolete. Runs synchronously and prints one summary line |
+| `/pmem dream` | Consolidate the next batch: merge duplicates, tighten wording, delete what is obsolete. Runs synchronously and reports how much of the store this cycle has reviewed; run it again for the next batch |
 | `/pmem auto on\|off` | Toggle extraction for this session only |
 | `/pmem extract` | Run a pass now, synchronously |
 
@@ -280,7 +280,7 @@ Add `-l` for the project-scoped entry. Removing the package does not delete note
 ## Limitations
 
 - No team or cloud sync, and no per-subagent store.
-- Consolidation (`dream`) is off by default. When on, one session claims a due pass under the store lock (others starting at the same time skip it) and runs it in the background, once per `dreamMinHours` and `dreamMinSessions`. A pass that reached the model keeps the timer even if it failed; a pass that never ran hands it back. Dream sees whole notes, newest first up to 12 KB, may only change or delete notes in that batch, deletes at most a quarter of the notes, and records a `pi-project-memory.dream` entry.
+- Consolidation (`dream`) is off by default. When on, one persistent session (not `pi -p` or `--no-session`) claims a due pass under the store lock (others starting at the same time skip it) and runs it in the background, once per `dreamMinHours` and `dreamMinSessions`. A pass that reached the model keeps the timer even if it failed; a pass that never ran hands it back. Dream sees whole notes, up to 12 KB per pass: it starts from the newest note not yet reviewed in the current cycle and adds related notes found by local keyword search, so repeated passes work through the whole store and similar notes land in the same batch. It may only change or delete notes in that batch, deletes at most a quarter of the notes, and records a `pi-project-memory.dream` entry.
 - A store stays readable even when a file breaks the limits: an oversized `MEMORY.md` is rebuilt down to the budget (dropping the oldest links, reported as `indexOmitted`), and a note body over 2,000 bytes is clamped in memory and reported as `truncated` instead of failing the whole store. The file on disk is left for you or an agent to repair.
 - The binding limit is the 25 KB index, as in Claude Code: near it the extension warns once per session, and at it new notes are refused (extraction records `index_full`) while existing notes still update, until you dream, compact or forget. The 1,024-topic cap is only a safety net.
 - Extraction checks each proposed note on its own: an invalid one (for example a preference quoted from the assistant) is dropped and listed in the entry's `rejected`, and the valid ones are saved.

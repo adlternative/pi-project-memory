@@ -465,3 +465,31 @@ test("a model reply between 16 and 32 KB is accepted and a larger one is refused
   size = 40_000;
   await assert.rejects(modelJSON(ctx, model, "Consolidate", {}), /output exceeds its hard cap/);
 });
+
+test("dream batches start from unreviewed notes and pull in related ones", async () => {
+  const { pickDreamBatch } = await import("../src/dream-batch.ts");
+  const at = (n: number) => `2026-01-01T00:${String(n).padStart(2, "0")}:00.000Z`;
+  const make = (id: string, title: string, content: string, n: number) => ({ ...draft(id, content), title, createdAt: at(n), updatedAt: at(n) });
+  const notes = [
+    make("deploy-old", "Deploy order", "Deploy canary then region then fleet.", 1),
+    make("unrelated", "Lunch spot", "The team eats at noon on Fridays.", 2),
+    make("deploy-new", "Deploy order update", "Deploy canary then region then fleet, with a pause.", 3),
+  ];
+  const first = pickDreamBatch(notes, new Set(), new Set(), 300);
+  assert.equal(first[0].id, "deploy-new", "the newest unreviewed note seeds the batch");
+  assert.equal(first[1]?.id, "deploy-old", "the related note comes before an unrelated, newer one");
+  const next = pickDreamBatch(notes, new Set(["deploy-new", "deploy-old"]), new Set(), 300);
+  assert.equal(next[0].id, "unrelated", "reviewed notes do not seed the next batch");
+  assert.deepEqual(pickDreamBatch(notes, new Set(), new Set(["deploy-new"]), 10_000).map(item => item.id).includes("deploy-new"), false, "clamped notes are skipped");
+});
+
+test("the dream review list survives session counting and resets after a full cycle", async t => {
+  const { store } = await fixture(t);
+  await store.save([draft("alpha", "Use pnpm."), draft("beta", "Run the linter."), draft("gamma", "Reviews go to payments.")]);
+  assert.deepEqual(await store.markDreamReviewed(["alpha"]), { reviewed: 1, total: 3 });
+  await store.noteDreamSession();
+  assert.ok(await store.claimDream(0, 1));
+  assert.deepEqual((await store.read()).dreamReviewed, ["alpha"], "counting sessions and claiming keep the review list");
+  assert.deepEqual(await store.markDreamReviewed(["beta", "gamma"]), { reviewed: 0, total: 3 }, "a full cycle starts over");
+  assert.equal((await store.read()).dreamReviewed, undefined);
+});
