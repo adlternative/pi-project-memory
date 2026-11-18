@@ -313,7 +313,9 @@ export default function projectMemory(pi: ExtensionAPI) {
    * since the last pass and folds it into the notes; its staged changes are applied as one transaction.
    * Runs on a cadence (min hours AND min sessions) or on demand, never concurrently with another pass.
    */
-  type DreamOutcome = { kind: "empty" } | { kind: "busy" } | { kind: "finished"; text: string };
+  type DreamOutcome = { kind: "empty" } | { kind: "busy"; dream: boolean } | { kind: "finished"; text: string };
+  // The running dream, so /pmem dream can say so and wait for its result instead of starting a second pass.
+  let dreaming: Promise<DreamOutcome> | undefined;
   // Long enough for a few dozen tool turns on a slow model; a pass past this applies nothing.
   const DREAM_TIMEOUT_MS = 6 * 60_000;
   // When the store has no record of an earlier pass, look back this far for sessions.
@@ -330,16 +332,17 @@ export default function projectMemory(pi: ExtensionAPI) {
   }
 
   async function dreamPass(ctx: ExtensionContext, memory: MemoryStore, trigger: "schedule" | "manual", lastAt: number | undefined, settle: () => void): Promise<DreamOutcome> {
-    if (!lifecycle) return { kind: "busy" };
-    if (jobs.size) { trailing = true; return { kind: "busy" }; }
+    if (!lifecycle) return { kind: "busy", dream: false };
+    // Only one memory pass at a time. A dream never queues itself; extraction catches up after a dream.
+    if (jobs.size) { if (!dreaming) trailing = true; return { kind: "busy", dream: dreaming !== undefined }; }
     if (quotaPaused(trigger)) {
       pi.appendEntry("pi-project-memory.dream", { status: "skipped", trigger, reason: "provider daily quota reached", pausedUntil: new Date(quotaPausedUntil).toISOString() });
-      return { kind: "busy" };
+      return { kind: "busy", dream: false };
     }
     const snapshot = await memory.read({ tolerant: true }).catch(() => undefined);
     if (!snapshot || snapshot.invalid || !snapshot.notes.length) return { kind: "empty" };
     const { model, requested } = extractionModel(ctx);
-    if (!model) return { kind: "busy" };
+    if (!model) return { kind: "busy", dream: false };
     const signal = AbortSignal.any([lifecycle.signal, AbortSignal.timeout(DREAM_TIMEOUT_MS)]);
     const started = Date.now();
     ctx.ui.setStatus("pmem-dream", `dreaming over ${snapshot.notes.length} notes`);
@@ -405,9 +408,12 @@ export default function projectMemory(pi: ExtensionAPI) {
       if (trailing) { trailing = false; if (lifecycle) startExtraction(ctx, "trailing"); }
     });
     jobs.add(job);
+    // Registered in the same tick as the job, so the busy check above sees it from now on.
+    const outcome: Promise<DreamOutcome> = job.then(() => ({ kind: "finished" as const, text: finished }));
+    dreaming = outcome;
+    void outcome.finally(() => { if (dreaming === outcome) dreaming = undefined; });
     // The caller decides whether to wait: /pmem dream reports at the command, session_start must not block.
-    await job;
-    return { kind: "finished", text: finished };
+    return outcome;
   }
 
   async function fileTarget(ctx: ExtensionContext, path: unknown) {
@@ -610,9 +616,16 @@ export default function projectMemory(pi: ExtensionAPI) {
       if (action === "show") { const note = state.notes.find(note => note.id === value); if (!note) throw new Error("Memory not found"); report(note); return; }
       if (action === "dream") {
         if (!enabled()) throw new Error("Memory is disabled for this process");
+        // A dream already running (for example the scheduled one /reload starts) is this request: wait for it.
+        if (dreaming) {
+          report("A dream pass is already running; its summary follows when it finishes.");
+          const outcome = await dreaming;
+          if (outcome.kind === "finished") report(outcome.text);
+          return;
+        }
         const outcome = await runDream(ctx, "manual");
         if (outcome.kind === "empty") report("Nothing to consolidate yet: no notes saved for this project.");
-        else if (outcome.kind === "busy") report("Another memory pass is running; consolidation will run after it.");
+        else if (outcome.kind === "busy") report(outcome.dream ? "A dream pass is already running; run /pmem status when it finishes." : "A memory extraction is running; run /pmem dream again in a minute.");
         else if (outcome.kind === "finished") report(outcome.text);
         return;
       }

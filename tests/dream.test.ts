@@ -264,3 +264,34 @@ test("delete_note refuses past the per-pass limit so the rest of the pass still 
   assert.deepEqual(data.deleted, ["n2", "n3"]);
   assert.deepEqual((await h.store.read()).notes.map(item => item.id).sort(), ["n1", "n4", "n5", "n6"]);
 });
+
+test("/pmem dream during a scheduled pass waits for it instead of reporting a queue that never runs", async t => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  const h = await makeHarness(t, {
+    settings: { projectMemory: { dream: true, dreamMinSessions: 1, dreamMinHours: 24 } },
+    answer: async request => {
+      if (!JSON.stringify(request.context).includes("Dream: consolidate this project")) return "Done.";
+      calls += 1;
+      await gate;
+      return "Nothing to consolidate.";
+    },
+  });
+  await mkdir(h.store.dir, { recursive: true, mode: 0o700 });
+  await writeFile(join(h.store.dir, "alpha.md"), renderTopic(note("alpha", "Use pnpm.")));
+  // A restart claims the due pass and runs it in the background, as /reload does.
+  await h.session.extensionRunner.emit({ type: "session_start", reason: "reload" } as never);
+  const deadline = Date.now() + 10_000;
+  while (calls === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(calls, 1, "the scheduled pass reached the model");
+  const manual = h.session.prompt("/pmem dream");
+  await new Promise(resolve => setTimeout(resolve, 100));
+  release();
+  await manual;
+  const reports = h.manager.getEntries().flatMap(item => item.type === "custom_message" && item.customType === "pi-project-memory.report" ? [String(item.content)] : []);
+  assert.ok(reports.some(text => /already running/.test(text)), reports.join(" | "));
+  assert.ok(reports.some(text => /Dream done in \d+s/.test(text)), "the waiting command reports the pass's result");
+  assert.equal(reports.some(text => /will run after it/.test(text)), false, "no promise of a queued pass");
+  assert.equal(calls, 1, "no second pass was started");
+});
